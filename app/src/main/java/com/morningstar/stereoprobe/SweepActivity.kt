@@ -24,6 +24,9 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import android.app.AlertDialog
+import android.text.InputType
+import android.widget.EditText
 import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
 import org.opencv.core.Mat
@@ -59,6 +62,8 @@ class SweepActivity : Activity(), SweepListener {
     private var probe: ProbeResult? = null
     private var targetCm = 6.0
     private var eyeALocked = false
+    private var lastTapX = -1
+    private var lastTapY = -1
 
     private var result: StereoAcquisitionResult? = null
     private var output: StereoOutput? = null
@@ -193,6 +198,7 @@ class SweepActivity : Activity(), SweepListener {
         resultRow.addView(btn("Rect") { show(ViewMode.RECT) })
         resultRow.addView(btn("Disp") { show(ViewMode.DISP) })
         resultRow.addView(btn("Depth") { show(ViewMode.DEPTH) })
+        resultRow.addView(btn("Set scale") { promptScale() })
         resultRow.addView(btn("Export") { export() })
 
         bottom.addView(row1)
@@ -246,7 +252,7 @@ class SweepActivity : Activity(), SweepListener {
                 for (i in 0 until n) bar.append(if (i == pos) '◦' else '─')
                 bar.append("○ Eye B")
                 bar.toString() + "\nparallax ${"%.1f".format(status.parallaxPx)} / ${"%.0f".format(status.parallaxTargetPx)} px" +
-                    "   ≈${"%.1f".format(status.baselineCm)} cm by sensors (coarse)" +
+                    (if (status.baselineCm >= 0) "   ≈${"%.1f".format(status.baselineCm)} cm by sensors (coarse)" else "") +
                     "\noverlap ${"%.0f".format(status.overlapPct)}%" +
                     "\npitch ${"%.1f".format(status.pitchDeg)}°  yaw ${"%.1f".format(status.yawDeg)}°  roll ${"%.1f".format(status.rollDeg)}°" +
                     "   geometry inliers ${status.inliers}"
@@ -289,7 +295,7 @@ class SweepActivity : Activity(), SweepListener {
                     ghost.setImageDrawable(null)
                     show(ViewMode.DISP)
                     val d = out.diagnostics
-                    progress.text = "baseline ${"%.1f".format(out.baselineM * 100)} cm (${"%.0f".format(result.baselineConfidence * 100)}% conf)  " +
+                    progress.text = (if (out.scaleState == "UNSCALED") "scale unknown (relative depth)  " else "baseline ${"%.1f".format(out.baselineM * 100)} cm [${out.scaleState}]  ") +
                         "valid ${"%.0f".format(d.optDouble("validDisparityFraction") * 100)}%  " +
                         "epipolar err ${"%.1f".format(d.optDouble("rectifiedEpipolarErrorMedianPx"))}px"
                 }
@@ -333,7 +339,8 @@ class SweepActivity : Activity(), SweepListener {
             else -> ""
         }
         if (d != null && (m == ViewMode.DISP || m == ViewMode.DEPTH)) {
-            hud.text = hud.text.toString() + "\nMetric scale depends on the movement estimate"
+            hud.text = hud.text.toString() + "\n" + (output?.rangeText() ?: "") +
+                (if (output?.scaleState == "UNSCALED") "\nTap a point, press Set scale, enter its real distance" else "")
         }
     }
 
@@ -347,8 +354,33 @@ class SweepActivity : Activity(), SweepListener {
         val bx = pts[0].toInt()
         val by = pts[1].toInt()
         val z = out.depthAt(bx, by)
-        hud.text = if (z != null) "≈ ${"%.2f".format(z)} m at ($bx, $by)\n(scale from the movement estimate; relative structure is unaffected)"
+        if (z != null) { lastTapX = bx; lastTapY = by }
+        hud.text = if (z != null) "≈ ${"%.2f".format(z)} ${out.unitLabel()} at ($bx, $by)\nscale: ${out.scaleState}" +
+            (if (out.scaleState == "UNSCALED") "  (relative: press Set scale)" else "")
         else "No reliable depth at ($bx, $by)"
+    }
+
+    /** Scale anchor: the user states the true distance to the last tapped point; depth scales linearly with the baseline. */
+    private fun promptScale() {
+        val out = output ?: return
+        if (lastTapX < 0) { Toast.makeText(this, "Tap a point on Disp or Depth first, then press Set scale", Toast.LENGTH_LONG).show(); return }
+        val et = EditText(this)
+        et.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        et.hint = "true distance in metres, e.g. 0.45"
+        AlertDialog.Builder(this)
+            .setTitle("Real distance to the tapped point")
+            .setView(et)
+            .setPositiveButton("Set") { _, _ ->
+                val v = et.text.toString().toDoubleOrNull()
+                if (v != null && out.anchor(v, lastTapX, lastTapY)) {
+                    hud.text = "Scale set from your distance.\n" + out.rangeText()
+                    progress.text = "baseline ${"%.1f".format(out.baselineM * 100)} cm [USER]"
+                } else {
+                    Toast.makeText(this, "Could not set scale at that point", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun export() {
@@ -377,6 +409,8 @@ class SweepActivity : Activity(), SweepListener {
                 .put("acquisition", res.quality)
                 .put("stereoPipeline", out?.diagnostics ?: JSONObject.NULL)
                 .put("baselineConfidence", res.baselineConfidence)
+                .put("scaleStateAtExport", out?.scaleState ?: JSONObject.NULL)
+                .put("baselineMAtExport", out?.baselineM ?: JSONObject.NULL)
                 .put("captureConfidence", res.captureConfidence)
             val lines = org.json.JSONArray()
             Diagnostics.allLines().forEach { lines.put(it) }

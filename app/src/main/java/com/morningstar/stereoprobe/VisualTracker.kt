@@ -24,7 +24,8 @@ class FrameFeatures(
     val width: Int,
     val height: Int,
     val sharpness: Double,      // variance of the Laplacian
-    val brightness: Double      // mean gray level
+    val brightness: Double,     // mean gray level
+    val hullArea: Double        // convex-hull area of ALL keypoints: the region where matches are even possible
 ) {
     fun release() = descriptors.release()
 }
@@ -79,7 +80,21 @@ class VisualTracker(nFeatures: Int = 1500) {
         lap.release(); mu.release(); sd.release()
 
         val bright = Core.mean(gray).`val`[0]
-        return FrameFeatures(pts, desc, gray.cols(), gray.rows(), s * s, bright)
+        return FrameFeatures(pts, desc, gray.cols(), gray.rows(), s * s, bright, hullAreaOf(pts.toList()))
+    }
+
+    private fun hullAreaOf(pts: List<Point>): Double {
+        if (pts.size < 3) return 0.0
+        val mp = MatOfPoint()
+        mp.fromList(pts)
+        val hullIdx = MatOfInt()
+        Imgproc.convexHull(mp, hullIdx)
+        val idx = hullIdx.toArray()
+        val hull = MatOfPoint2f()
+        hull.fromList(idx.map { pts[it] })
+        val area = Imgproc.contourArea(hull)
+        mp.release(); hullIdx.release(); hull.release()
+        return area
     }
 
     /** [k] must be the intrinsics of the images the features came from. [imuRotCam] maps camera-A to camera-B coordinates. */
@@ -109,7 +124,7 @@ class VisualTracker(nFeatures: Int = 1500) {
         val keepC = BooleanArray(n) { resid[it] < consistThresh }
         val consistentPct = 100.0 * keepC.count { it } / n
         val flowMedian = FrameSynchronizer.median(resid.toList())
-        val overlapC = coveragePct(pa, keepC, a.width, a.height)
+        val overlapC = coveragePct(pa, keepC, a.hullArea)
 
         val p1 = MatOfPoint2f(); p1.fromList(pa)
         val p2 = MatOfPoint2f(); p2.fromList(pb)
@@ -145,7 +160,7 @@ class VisualTracker(nFeatures: Int = 1500) {
             tMat.get(0, 0, tArr)
         }
 
-        val overlapE = coveragePct(pa, keepE, a.width, a.height)
+        val overlapE = coveragePct(pa, keepE, a.hullArea)
         val visRes = if (poseOk) medianResidual(pa, pb, keepE, rArr, k) else 0.0
         val imuRes = if (imuRotCam != null) FrameSynchronizer.median((0 until n).filter { keepE[it] }.map { resid[it] }) else 0.0
         val disagreement = if (poseOk && imuRotCam != null) Mat3.angleDeg(Mat3.mul(Mat3.transpose(rArr), imuRotCam)) else 0.0
@@ -158,21 +173,16 @@ class VisualTracker(nFeatures: Int = 1500) {
         )
     }
 
-    /** Convex-hull area of the selected matches in image A as a percentage of the frame. */
-    private fun coveragePct(pa: List<Point>, keep: BooleanArray, w: Int, h: Int): Double {
+    /**
+     * Hull area of the selected matches as a percentage of the hull of ALL keypoints in frame A.
+     * Normalising by textured area (not the whole frame) means low-texture regions such as plain fabric no longer
+     * cap the score at ~45%: 100% means every place that could match, did.
+     */
+    private fun coveragePct(pa: List<Point>, keep: BooleanArray, allHullArea: Double): Double {
+        if (allHullArea <= 1.0) return 0.0
         val pts = ArrayList<Point>()
         for (i in pa.indices) if (keep[i]) pts.add(pa[i])
-        if (pts.size < 3) return 0.0
-        val mp = MatOfPoint()
-        mp.fromList(pts)
-        val hullIdx = MatOfInt()
-        Imgproc.convexHull(mp, hullIdx)
-        val idx = hullIdx.toArray()
-        val hull = MatOfPoint2f()
-        hull.fromList(idx.map { pts[it] })
-        val area = Imgproc.contourArea(hull)
-        mp.release(); hullIdx.release(); hull.release()
-        return (100.0 * area / (w.toDouble() * h)).coerceIn(0.0, 100.0)
+        return (100.0 * hullAreaOf(pts) / allHullArea).coerceIn(0.0, 100.0)
     }
 
     /** Distance between observed x2 and the rotation-only prediction x2 ≈ K R K^-1 x1. */

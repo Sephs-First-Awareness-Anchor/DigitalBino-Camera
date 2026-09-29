@@ -95,11 +95,15 @@ class StereoAcquisitionResult(
     val intrinsics: Intrinsics,
     val relativeRotation: DoubleArray,      // 3x3 row-major
     val translationUnit: DoubleArray,       // unit vector
-    val baselineMeters: Double,
+    val baselineMeters: Double,             // 1.0 (relative units) when scaleKnown is false
     val baselineSource: String,
     val baselineConfidence: Double,         // 0..1
     val captureConfidence: Double,          // 0..1
-    val quality: JSONObject
+    val quality: JSONObject,
+    val scaleKnown: Boolean,                // false: depth is relative until a scale anchor is applied
+    val scaleSource: String,
+    val focusDistanceM: Double?,            // camera-reported focus distance at capture, if any
+    val focusCalibration: String            // UNCALIBRATED / APPROXIMATE / CALIBRATED / n/a
 ) {
     fun release() {
         first.release()

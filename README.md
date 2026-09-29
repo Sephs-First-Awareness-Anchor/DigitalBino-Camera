@@ -89,3 +89,21 @@ All eight attempts failed with "Scene changed too much". The log showed this was
 - Either slide direction is accepted (direction auto-detected).
 - Reset race ("CameraDevice was already closed") fixed: callbacks ignore a stopped provider, RESET is debounced.
 - On failure the app saves `sweepfail_*.json` (per-frame telemetry) plus Eye A and last-frame PNGs to Downloads/StereoProbe.
+
+
+## v0.2.2 (after the first complete on-device capture)
+The 02:07:58 capture proved the geometry: 1,640 row-aligned matches at 0.00 px median vertical error after rectification, disparity rising
+smoothly from wall (10 px) to plush (18 px) to legs (36 px), 89% sideways motion, 0.6 deg rotation. What it exposed:
+- **Metric scale was wrong by an order of magnitude.** Accelerometer double integration reported 129 cm of travel over an 11.5 s sweep
+  (baseline 20.1 cm); the measured disparities imply roughly 1-2 cm. Now the accelerometer is trusted only within `imuTrustSec` (2.5 s) and
+  `maxPlausibleImuM` (30 cm) AND when its direction agrees with vision; otherwise depth is UNSCALED (relative, in "baselines").
+  Scale then comes from, in order: short plausible IMU sweep, camera focus distance (only if the lens reports APPROXIMATE/CALIBRATED; the
+  app logs `focus-distance calibration:` at start), or **Set scale**: tap a point in Disp/Depth, press Set scale, type its real distance in metres.
+- **Overlap metric** was measured against the whole frame, but only ~52% of it is textured, so it hovered at 43-46% against a 45% threshold.
+  Now measured against the hull of all keypoints in frame A (90.8% on the real pair); threshold 60%.
+- Depth colours now use the data's own 2nd-98th percentile range, independent of the scale.
+- Left/right order is decided by measured disparity sign (stereoRectify ignores the sign of T; recoverPose's sign can be wrong on noisy data).
+- Local photometric normalisation before SGBM; rectifyAlpha 1.0 so nothing is cropped; valid-region mask; rectification rotation and zoom are logged.
+- Vision-based "slide straight, do not arc" gate; colour-cycling lights trigger a warning.
+Verified: compiles against android-34 + OpenCV 4.9.0; overlap metric replayed on the real pair; normalisation tested on synthetic pairs.
+Not verified on device: the new scale UI, the focus-distance anchor, the new rectification defaults.

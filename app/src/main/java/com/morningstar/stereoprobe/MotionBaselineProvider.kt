@@ -9,6 +9,8 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.Image
@@ -41,11 +43,13 @@ class SweepConfig {
     @Volatile var targetBaselineM = 0.06        // guidance and metric-scale reference, NOT the acceptance test
     var acceptParallaxPx = 10.0                 // translation-induced parallax (tracking-scale px) required to accept Eye B
     var rotationToleranceDeg = 5.0
-    var minOverlapPct = 45.0
+    var minOverlapPct = 60.0                    // of the TEXTURED area of frame A (plain fabric no longer caps the score)
     var minEInliers = 40
     var minSharpnessRatio = 0.45
     var maxBrightnessDiff = 0.25
     var minLateralFraction = 0.4                // loose: integrated IMU displacement drifts, so this is only a sanity check
+    var minVisionLateral = 0.8                  // share of camera motion that must be sideways, measured by VISION (not the IMU)
+    var chromaWarn = 0.08                       // L1 change in colour balance between the eyes that triggers a lighting warning
     var minSignedLateralFraction = 0.3          // of target baseline, in the sweep direction
     var settleMs = 350L
     var timeoutMs = 30_000L
@@ -57,6 +61,8 @@ class SweepConfig {
     var sceneBadFrames = 25
     var stillAccRms = 0.25                      // m/s^2: below this the phone is considered held still
     var stillGyro = 0.12                        // rad/s
+    var imuTrustSec = 2.5                       // accelerometer double-integration is not trusted beyond this
+    var maxPlausibleImuM = 0.30                 // a handheld sweep displacement beyond this is drift, not motion
 }
 
 object Yuv {
@@ -110,7 +116,7 @@ class MotionBaselineProvider(
 
     private enum class Phase { LIVE, WAIT_EYE_A, SWEEPING, SETTLING, PROCESSING, DONE, FAILED }
 
-    private class EyeA(val up: Mat, val feats: FrameFeatures, val tsNs: Long, val rot: DoubleArray)
+    private class EyeA(val up: Mat, val feats: FrameFeatures, val tsNs: Long, val rot: DoubleArray, val meanBgr: DoubleArray)
 
     private class Candidate(
         val up: Mat, val tsNs: Long, val score: Double, val parallax: Double,
@@ -143,6 +149,13 @@ class MotionBaselineProvider(
     private var reader: ImageReader? = null
     private var afContinuous = false
     private var aeLockAvailable = false
+    private var focusCalibration = "n/a"
+    @Volatile private var lastFocusDiopters = -1f
+    private val focusCb = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { lastFocusDiopters = it }
+        }
+    }
 
     // geometry
     private lateinit var kUp: Intrinsics
@@ -263,6 +276,13 @@ class MotionBaselineProvider(
             afContinuous = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
                 ?.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) == true
             aeLockAvailable = chars.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true
+            focusCalibration = when (chars.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION)) {
+                CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED -> "UNCALIBRATED"
+                CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_APPROXIMATE -> "APPROXIMATE"
+                CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_CALIBRATED -> "CALIBRATED"
+                else -> "n/a"
+            }
+            Diagnostics.log(TAG, "focus-distance calibration: $focusCalibration")
 
             val rd = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 3)
             reader = rd
@@ -330,7 +350,7 @@ class MotionBaselineProvider(
                             b.addTarget(rd.surface)
                             if (afContinuous) b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                             builder = b
-                            s.setRepeatingRequest(b.build(), null, camHandler)
+                            s.setRepeatingRequest(b.build(), focusCb, camHandler)
                             Diagnostics.log(TAG, "camera streaming (single continuous session)")
                         } catch (t: Throwable) {
                             failUi("Could not start streaming: ${Diagnostics.describe(t)}")
@@ -364,7 +384,7 @@ class MotionBaselineProvider(
                         if (locked) CaptureRequest.CONTROL_AF_MODE_AUTO else CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
                     )
                 }
-                s.setRepeatingRequest(b.build(), null, camHandler)
+                s.setRepeatingRequest(b.build(), focusCb, camHandler)
                 Diagnostics.log(TAG, "AE/AWB/AF ${if (locked) "LOCKED" else "released"} (aeLockAvailable=$aeLockAvailable)")
             } catch (t: Throwable) {
                 if (!stopped) Diagnostics.error(TAG, "lock update failed", t)
@@ -449,7 +469,8 @@ class MotionBaselineProvider(
             failUi("Motion sensors are not reporting orientation.")
             return
         }
-        eyeA = EyeA(up.clone(), feats, tsNs, rot)
+        val mean = Core.mean(up)
+        eyeA = EyeA(up.clone(), feats, tsNs, rot, doubleArrayOf(mean.`val`[0], mean.`val`[1], mean.`val`[2]))
         sensors.beginIntegration(tsNs)
         setLocks(true)
         rejected = 0; rejectReasons.clear(); sceneBadStreak = 0; sweepSign = 0; frameLog.clear()
@@ -497,6 +518,24 @@ class MotionBaselineProvider(
         val fb = tracker.describe(gray)
         val m = tracker.compare(a.feats, fb, kTrack, relCam)
 
+        // Accelerometer double-integration is only meaningful for a couple of seconds (an 11 s sweep once reported 1.3 m).
+        val elapsedSec = (tsNs - a.tsNs) / 1e9
+        val imuTrusted = elapsedSec <= cfg.imuTrustSec
+        val baselineForHud = if (imuTrusted) lateral else -1.0
+
+        // Direction of camera motion measured by vision: c = -R^T t in camera-A axes; x is sideways.
+        val visLat: Double = if (m.rotation != null && m.tUnit != null) {
+            val rtv = Mat3.mulVec(Mat3.transpose(m.rotation), m.tUnit)
+            val cv = doubleArrayOf(-rtv[0], -rtv[1], -rtv[2])
+            abs(cv[0]) / max(1e-9, Mat3.norm(cv))
+        } else 0.0
+        val visLatOk = m.rotation == null || visLat >= cfg.minVisionLateral
+
+        // Lighting: colour-cycling lights change the scene between the eyes even with exposure and white balance locked.
+        val mb = Core.mean(up)
+        val cb = doubleArrayOf(mb.`val`[0], mb.`val`[1], mb.`val`[2])
+        val chromaShift = chromaDistance(a.meanBgr, cb)
+
         val parallax = m.parallaxImuRotPx
         val progress = parallax / cfg.acceptParallaxPx
         val overlapOk = m.overlapPct >= cfg.minOverlapPct
@@ -505,7 +544,7 @@ class MotionBaselineProvider(
         val sharpOk = fb.sharpness >= cfg.minSharpnessRatio * a.feats.sharpness
         val brightOk = abs(fb.brightness - a.feats.brightness) / max(1.0, a.feats.brightness) <= cfg.maxBrightnessDiff
         val latFrac = if (total > 1e-6) lateral / total else 0.0
-        val latDirOk = latFrac >= cfg.minLateralFraction && lateral >= cfg.minSignedLateralFraction * target
+        val latDirOk = !imuTrusted || (latFrac >= cfg.minLateralFraction && lateral >= cfg.minSignedLateralFraction * target)
         val consistentOk = m.matches < 60 || m.consistentPct >= 25.0
         val eRatio = if (m.matches > 0) m.eInliers.toDouble() / m.matches else 0.0
         // "Scene changed" only when matches are wrong everywhere (rotation-inconsistent AND no epipolar structure).
@@ -518,6 +557,7 @@ class MotionBaselineProvider(
         if (!sharpOk) reasons.add("blur")
         if (!brightOk) reasons.add("exposure")
         if (!latDirOk) reasons.add("not-lateral")
+        if (!visLatOk) reasons.add("arcing")
         if (!consistentOk) reasons.add("scene-changed")
         val gatesExceptParallax = reasons.isEmpty()
         if (!parallaxOk) reasons.add("parallax")
@@ -551,6 +591,7 @@ class MotionBaselineProvider(
             .put("overlapPct", m.overlapPct).put("consistentPct", m.consistentPct)
             .put("parallaxImuPx", m.parallaxImuRotPx).put("parallaxVisPx", m.parallaxVisRotPx)
             .put("flowMedianPx", m.flowMedianPx).put("imuVisRotDisagreeDeg", m.imuVisRotDisagreementDeg)
+            .put("visionLateralShare", visLat).put("chromaShift", chromaShift)
             .put("sharpRatio", fb.sharpness / max(1e-6, a.feats.sharpness))
             .put("score", score).put("still", stillNow).put("eligible", eligible)
             .put("reasons", reasons.joinToString(","))
@@ -584,7 +625,7 @@ class MotionBaselineProvider(
                 }
                 phase = Phase.SWEEPING
             } else {
-                status("Baseline acquired", "Hold still: choosing the best frame", lateral, progress, pitch, yaw, roll, m, parallax, rotOk)
+                status("Baseline acquired", "Hold still: choosing the best frame", baselineForHud, progress, pitch, yaw, roll, m, parallax, rotOk)
                 return
             }
         }
@@ -594,8 +635,9 @@ class MotionBaselineProvider(
             !parallaxOk && total < 0.008 && progress < 0.15 -> Pair("Slide phone $dirWord", "Keep the phone's orientation, move it sideways")
             !parallaxOk -> Pair(
                 "Keep sliding $dirWord",
-                "Parallax ${"%.1f".format(parallax)} of ${"%.0f".format(cfg.acceptParallaxPx)} px  ·  about ${"%.1f".format(lateral * 100)} cm by motion sensors (coarse)"
+                "Parallax ${"%.1f".format(parallax)} of ${"%.0f".format(cfg.acceptParallaxPx)} px"
             )
+            !visLatOk -> Pair("Slide straight sideways", "Camera motion is only ${"%.0f".format(visLat * 100)}% sideways: keep the phone level and do not swing it in an arc")
             !latDirOk -> Pair("Move sideways, not forward or up", "Sensors say the motion is mostly not sideways")
             !overlapOk -> Pair("Bring the scene back into view", "")
             !sharpOk -> Pair("Slow down", "Motion blur")
@@ -603,7 +645,14 @@ class MotionBaselineProvider(
             !consistentOk -> Pair("Scene is changing", "Keep the subject still")
             else -> Pair("Baseline acquired", "")
         }
-        status(headline, detail, lateral, progress, pitch, yaw, roll, m, parallax, rotOk)
+        val lightNote = if (chromaShift > cfg.chromaWarn) "\nLighting is changing colour: set room lights to a fixed colour" else ""
+        status(headline, detail + lightNote, baselineForHud, progress, pitch, yaw, roll, m, parallax, rotOk)
+    }
+
+    private fun chromaDistance(a: DoubleArray, b: DoubleArray): Double {
+        val sa = max(1.0, a[0] + a[1] + a[2])
+        val sb = max(1.0, b[0] + b[1] + b[2])
+        return abs(a[0] / sa - b[0] / sb) + abs(a[1] / sa - b[1] / sb) + abs(a[2] / sa - b[2] / sb)
     }
 
     /** Derived from right-hand rotation of the device about its own axes; direction wording still to be confirmed on hardware. */
@@ -681,6 +730,7 @@ class MotionBaselineProvider(
         .put("minEInliers", config.minEInliers)
         .put("minSharpnessRatio", config.minSharpnessRatio)
         .put("minLateralFraction", config.minLateralFraction)
+        .put("minVisionLateral", config.minVisionLateral)
         .put("sceneBadFrames", config.sceneBadFrames)
 
     // ───────────────────────── finalize: refine pose, fuse baseline, emit result ─────────────────────────
@@ -741,18 +791,29 @@ class MotionBaselineProvider(
         val dCam = doubleArrayOf(dDevUsed[0], -dDevUsed[1], -dDevUsed[2])   // upright camera-A axes
         val dNorm = Mat3.norm(dCam)
         val cos = if (dNorm > 1e-9) Mat3.dot(dCam, cVis) / (dNorm * Mat3.norm(cVis)) else 0.0
+        // The magnitude is only believed for a short, plausible, direction-consistent sweep. Otherwise depth stays RELATIVE
+        // (baseline = 1.0 unit) until a scale anchor (camera focus distance, or a tapped known distance) is applied.
+        val imuPlausible = tSec <= config.imuTrustSec && dNorm <= config.maxPlausibleImuM && cos > 0.5
         val baseline: Double
         val baselineSource: String
-        if (cos > 0.5) {
+        val scaleKnown: Boolean
+        val scaleSource: String
+        if (imuPlausible) {
             baseline = Mat3.dot(dCam, cVis) / Mat3.norm(cVis)
+            scaleKnown = true
+            scaleSource = "IMU"
             baselineSource = "motion-sensor displacement${if (best.still) " (drift-corrected, held still)" else " (NOT drift-corrected: phone was moving)"} " +
                 "projected onto the visual translation direction (cos=${"%.2f".format(cos)})"
         } else {
-            baseline = dNorm
-            baselineSource = "motion-sensor displacement magnitude; its direction DISAGREES with vision (cos=${"%.2f".format(cos)}), scale unreliable"
+            baseline = 1.0
+            scaleKnown = false
+            scaleSource = "NONE"
+            baselineSource = "UNSCALED: accelerometer distance is unreliable (sweep took ${"%.1f".format(tSec)} s, limit ${"%.1f".format(config.imuTrustSec)} s; " +
+                "raw estimate ${"%.0f".format(dNorm * 100)} cm; direction agreement cos=${"%.2f".format(cos)}). Depth is relative until a scale anchor is applied."
         }
         val stillFactor = if (best.still) 1.0 else 0.6
-        val baselineConf = cos.coerceIn(0.0, 1.0) * min(1.0, vm.eInliers / 150.0) * stillFactor
+        val baselineConf = if (scaleKnown) cos.coerceIn(0.0, 1.0) * min(1.0, vm.eInliers / 150.0) * stillFactor else 0.0
+        val focusM: Double? = if (lastFocusDiopters > 0.2f) 1.0 / lastFocusDiopters else null
         val captureConf = (0.5 * best.score + 0.5 * baselineConf).coerceIn(0.0, 1.0)
 
         val q = JSONObject()
@@ -762,7 +823,13 @@ class MotionBaselineProvider(
             .put("intrinsics", kUp.toJson())
             .put("poseSource", poseSource)
             .put("requestedBaselineM", config.targetBaselineM)
-            .put("estimatedBaselineM", baseline)
+            .put("estimatedBaselineM", if (scaleKnown) baseline else JSONObject.NULL)
+            .put("scaleKnown", scaleKnown)
+            .put("scaleSource", scaleSource)
+            .put("rawImuDisplacementM", dNorm)
+            .put("focusDistanceDiopters", lastFocusDiopters)
+            .put("focusDistanceM", focusM ?: JSONObject.NULL)
+            .put("focusCalibration", focusCalibration)
             .put("baselineSource", baselineSource)
             .put("heldStillAtEyeB", best.still)
             .put("imuDisplacementRawDeviceAxesM_xRight_yUp_zTowardUser", JSONArray(dDevRaw.toList()))
@@ -784,6 +851,7 @@ class MotionBaselineProvider(
             .put("selectedCandidateScore", best.score)
             .put("sharpnessEyeA", a.feats.sharpness).put("sharpnessEyeB", best.sharp)
             .put("aeAwbAfLocked", aeLockAvailable)
+            .put("chromaShiftEyeAtoEyeB", chromaDistance(a.meanBgr, Core.mean(best.up).let { doubleArrayOf(it.`val`[0], it.`val`[1], it.`val`[2]) }))
             .put("config", configJson())
             .put("frames", JSONArray(frameLog))
 
@@ -791,10 +859,11 @@ class MotionBaselineProvider(
         a.feats.release()
         val result = StereoAcquisitionResult(
             AcquisitionMethod.MOTION_BASELINE, a.up, best.up, a.tsNs, best.tsNs, kUp,
-            rot, tu, baseline, baselineSource, baselineConf, captureConf, q
+            rot, tu, baseline, baselineSource, baselineConf, captureConf, q,
+            scaleKnown, scaleSource, focusM, focusCalibration
         )
         phase = Phase.DONE
-        Diagnostics.log(TAG, "RESULT baseline=${"%.1f".format(baseline * 100)}cm conf=${"%.2f".format(captureConf)} E=${vm.eInliers} dt=${"%.0f".format(tSec * 1000)}ms still=${best.still}")
+        Diagnostics.log(TAG, "RESULT scale=${if (scaleKnown) "%.1fcm".format(baseline * 100) else "UNSCALED (raw imu %.0fcm)".format(dNorm * 100)} focus=${focusM?.let { "%.2fm".format(it) } ?: "n/a"}/$focusCalibration conf=${"%.2f".format(captureConf)} E=${vm.eInliers} dt=${"%.0f".format(tSec * 1000)}ms still=${best.still}")
         if (!stopped) listener.onResult(result)
     }
 }
