@@ -45,6 +45,8 @@ class MainActivity : Activity() {
     private var probe: ProbeResult? = null
     private var run: TestRun? = null
     private val flips = ArrayList<FlipResult>()
+    private val holds = ArrayList<HoldResult>()
+    private val fastFlips = ArrayList<FastFlipResult>()
 
     private val busy = AtomicBoolean(false)
     private val refreshPending = AtomicBoolean(false)
@@ -109,6 +111,7 @@ class MainActivity : Activity() {
         root.addView(button("1 · PROBE DEVICE + CAMERAS") { launch("PROBE") { ensureProbe(force = true) } })
         root.addView(button("2 · TEST ALL CAMERA PAIRS") { doTestPairs() })
         root.addView(button("3 · FLIP TEST (sequential, NOT stereo)") { doFlipTest() })
+        root.addView(button("3b · HOLD / SUSPEND + FAST FLIP TEST") { doHoldTest() })
         root.addView(button("4 · EXPORT REPORT (JSON + TXT) & SHARE") { doExport() })
 
         scroll = ScrollView(this)
@@ -147,6 +150,11 @@ class MainActivity : Activity() {
         if (flips.isNotEmpty()) {
             sb.append("═══ FLIP TESTS (sequential, not stereo) ═══\n")
             flips.forEach { sb.append(it.summary()).append('\n') }
+        }
+        if (holds.isNotEmpty() || fastFlips.isNotEmpty()) {
+            sb.append("═══ HOLD / SUSPEND TESTS ═══\n")
+            holds.forEach { sb.append(it.summary()).append('\n') }
+            fastFlips.forEach { sb.append(it.summary()).append('\n') }
         }
         sb.append("═══ LOG (last 60) ═══\n")
         Diagnostics.allLines().takeLast(60).forEach { sb.append(it).append('\n') }
@@ -192,6 +200,8 @@ class MainActivity : Activity() {
         probe = p
         run = null
         flips.clear()
+        holds.clear()
+        fastFlips.clear()
         return p
     }
 
@@ -238,10 +248,41 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun doHoldTest() {
+        if (!hasCameraPermission()) {
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
+            toast("Grant camera permission, then press again")
+            return
+        }
+        launch("HOLD TEST") {
+            val p = ensureProbe()
+            val pairs = p.rearRearListedPairs()
+            if (pairs.isEmpty()) {
+                Diagnostics.log(TAG, "hold test: fewer than two listed rear cameras")
+                return@launch
+            }
+            val coord = CameraCoordinator(applicationContext, p)
+            try {
+                val tester = HoldTester(applicationContext, coord, p)
+                for ((a, b) in pairs) {
+                    // Both orders: the earlier pair test only tried A first, then B.
+                    Diagnostics.setState("HOLD TEST: hold $a, open $b")
+                    holds.add(tester.runHold(a, b))
+                    Diagnostics.setState("HOLD TEST: hold $b, open $a")
+                    holds.add(tester.runHold(b, a))
+                    Diagnostics.setState("HOLD TEST: fast flip $a ↔ $b")
+                    fastFlips.add(tester.runFastFlip(a, b))
+                }
+            } finally {
+                coord.shutdown()
+            }
+        }
+    }
+
     private fun doExport() {
         launch("EXPORT") {
-            val json = ReportExporter.buildJson(device, probe, run, flips)
-            val text = ReportExporter.buildText(deviceSummary, probe, run, flips)
+            val json = ReportExporter.buildJson(device, probe, run, flips, holds, fastFlips)
+            val text = ReportExporter.buildText(deviceSummary, probe, run, flips, holds, fastFlips)
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val model = Build.MODEL.replace(Regex("[^A-Za-z0-9]+"), "_")
             val base = "stereoprobe_${model}_$stamp"

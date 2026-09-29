@@ -15,6 +15,9 @@ Question this APK answers: **can this Galaxy A16 actually see through two rear c
    logical-camera physical streams, and direct-open attempts on hidden physical IDs. Takes about a minute.
    Close other camera apps first (CAMERA_IN_USE will otherwise pollute results).
 3. **FLIP TEST**: measures the open/grab/close/switch loop for every rear pair. Labelled sequential, never stereo.
+3b. **HOLD / SUSPEND + FAST FLIP**: Camera2 has no suspend call, so this tests the nearest equivalents in BOTH open orders:
+   device A open but idle, and device A open with its session closed, then tries to open B. If both can stay open it
+   measures a session-swap bounce; it also times a fast flip phase by phase (open / session / first frame / close) with retry-on-busy and no artificial pauses.
 4. **EXPORT**: writes JSON + TXT to Downloads/StereoProbe and opens the share sheet.
 
 ## Classification labels

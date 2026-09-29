@@ -19,7 +19,9 @@ object ReportExporter {
         device: JSONObject?,
         probe: ProbeResult?,
         run: TestRun?,
-        flips: List<FlipResult>
+        flips: List<FlipResult>,
+        holds: List<HoldResult> = emptyList(),
+        fast: List<FastFlipResult> = emptyList()
     ): JSONObject {
         val j = JSONObject()
         j.put("reportFormat", "stereoprobe/1")
@@ -31,6 +33,12 @@ object ReportExporter {
         val fl = JSONArray()
         flips.forEach { fl.put(it.toJson()) }
         j.put("flipTests", fl)
+        val hl = JSONArray()
+        holds.forEach { hl.put(it.toJson()) }
+        j.put("holdTests", hl)
+        val ff = JSONArray()
+        fast.forEach { ff.put(it.toJson()) }
+        j.put("fastFlipTests", ff)
         val log = JSONArray()
         Diagnostics.allLines().forEach { log.put(it) }
         j.put("log", log)
@@ -41,7 +49,9 @@ object ReportExporter {
         deviceSummary: String?,
         probe: ProbeResult?,
         run: TestRun?,
-        flips: List<FlipResult>
+        flips: List<FlipResult>,
+        holds: List<HoldResult> = emptyList(),
+        fast: List<FastFlipResult> = emptyList()
     ): String {
         val sb = StringBuilder()
         sb.append("STEREO PROBE REPORT — authored by Sunni (Sir) Morningstar and Cael Devo\n")
@@ -52,6 +62,11 @@ object ReportExporter {
         if (flips.isNotEmpty()) {
             sb.append("═══ FLIP TESTS (sequential, not stereo) ═══\n")
             flips.forEach { sb.append(it.summary()).append('\n') }
+        }
+        if (holds.isNotEmpty() || fast.isNotEmpty()) {
+            sb.append("═══ HOLD / SUSPEND TESTS ═══\n")
+            holds.forEach { sb.append(it.summary()).append('\n') }
+            fast.forEach { sb.append(it.summary()).append('\n') }
         }
         sb.append("═══ LOG ═══\n")
         Diagnostics.allLines().forEach { sb.append(it).append('\n') }
