@@ -103,12 +103,33 @@ class StereoAcquisitionResult(
     val scaleKnown: Boolean,                // false: depth is relative until a scale anchor is applied
     val scaleSource: String,
     val focusDistanceM: Double?,            // camera-reported focus distance at capture, if any
-    val focusCalibration: String            // UNCALIBRATED / APPROXIMATE / CALIBRATED / n/a
+    val focusCalibration: String,           // UNCALIBRATED / APPROXIMATE / CALIBRATED / n/a
+    val sensorMetrics: SensorMetrics? = null
 ) {
     fun release() {
         first.release()
         second.release()
     }
+}
+
+/**
+ * Everything the app knows about the move from eye A to eye B WITHOUT looking at eye B's pixels.
+ * (The visually estimated pose is deliberately excluded: it is computed by matching A against B, so using it would leak B.)
+ */
+class SensorMetrics(
+    val gyroRotationCam: DoubleArray,   // camera A -> camera B rotation from the gyroscope (3x3 row-major)
+    val imuLateralM: Double,            // signed sideways displacement of the camera (camera-A x axis), accelerometer, drift-prone
+    val imuTotalM: Double,              // magnitude of the accelerometer displacement
+    val focusDistanceM: Double?,        // camera-reported focus distance
+    val sweepSeconds: Double,
+    val heldStill: Boolean,
+    val imuTrusted: Boolean
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("gyroRotationCam", org.json.JSONArray(gyroRotationCam.toList()))
+        .put("imuLateralM", imuLateralM).put("imuTotalM", imuTotalM)
+        .put("focusDistanceM", focusDistanceM ?: JSONObject.NULL)
+        .put("sweepSeconds", sweepSeconds).put("heldStill", heldStill).put("imuTrusted", imuTrusted)
 }
 
 class SweepStatus(

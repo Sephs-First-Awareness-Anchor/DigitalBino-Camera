@@ -47,7 +47,7 @@ class SweepActivity : Activity(), SweepListener {
         private const val REQ_CAMERA = 200
     }
 
-    private enum class ViewMode { LIVE, EYE_A, EYE_B, RECT, DISP, DEPTH }
+    private enum class ViewMode { LIVE, EYE_A, EYE_B, RECT, DISP, DEPTH, GUESS, ERR }
 
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var live: ImageView
@@ -62,6 +62,9 @@ class SweepActivity : Activity(), SweepListener {
     private var probe: ProbeResult? = null
     private var targetCm = 6.0
     private var eyeALocked = false
+    private var lastReveal: Reveal? = null
+    private var guessMat: Mat? = null
+    private var errMat: Mat? = null
     private var lastTapX = -1
     private var lastTapY = -1
 
@@ -198,6 +201,8 @@ class SweepActivity : Activity(), SweepListener {
         resultRow.addView(btn("Rect") { show(ViewMode.RECT) })
         resultRow.addView(btn("Disp") { show(ViewMode.DISP) })
         resultRow.addView(btn("Depth") { show(ViewMode.DEPTH) })
+        resultRow.addView(btn("Guess B") { show(ViewMode.GUESS) })
+        resultRow.addView(btn("Error") { show(ViewMode.ERR) })
         resultRow.addView(btn("Set scale") { promptScale() })
         resultRow.addView(btn("Export") { export() })
 
@@ -282,6 +287,22 @@ class SweepActivity : Activity(), SweepListener {
         provider = null
         ui.post { hud.text = "Building depth from the two views…" }
         Thread {
+            // The app's own guess for eye B: eye A + sensor metrics ONLY. Eye B is handed over afterwards, by reveal().
+            try {
+                val metrics = result.sensorMetrics
+                if (metrics != null) {
+                    val predictor = ViewPredictor(applicationContext)
+                    val pred = predictor.predict(result.first, result.intrinsics, metrics)
+                    val rev = predictor.reveal(pred, result.first, result.second)
+                    bitmaps[ViewMode.GUESS] = Bmp.fromBgr(pred.guess)
+                    bitmaps[ViewMode.ERR] = Bmp.fromBgr(rev.errorImage)
+                    guessMat = pred.guess.clone(); errMat = rev.errorImage.clone()
+                    lastReveal = rev
+                    pred.release(); rev.errorImage.release()
+                }
+            } catch (t: Throwable) {
+                Diagnostics.error(TAG, "view prediction failed", t)
+            }
             try {
                 val out = StereoPipeline().process(result)
                 output = out
@@ -336,6 +357,8 @@ class SweepActivity : Activity(), SweepListener {
             ViewMode.RECT -> "Rectified pair: features should share a green line"
             ViewMode.DISP -> "Disparity (warm = closer). Tap for distance."
             ViewMode.DEPTH -> "Depth (warm = closer). Tap for distance."
+            ViewMode.GUESS -> "The app's GUESS for Eye B, built from Eye A and sensor metrics only\n" + (lastReveal?.summary() ?: "")
+            ViewMode.ERR -> "Guess vs the real Eye B (bright = wrong)\n" + (lastReveal?.summary() ?: "")
             else -> ""
         }
         if (d != null && (m == ViewMode.DISP || m == ViewMode.DEPTH)) {
@@ -403,12 +426,16 @@ class SweepActivity : Activity(), SweepListener {
             png("rectPairLines", out?.rectPairLines)
             png("disparity", out?.disparityColor)
             png("depth", out?.depthColor)
+            png("guessB", guessMat)
+            png("guessError", errMat)
             val json = JSONObject()
                 .put("reportFormat", "binosweep/1")
                 .put("authors", "Sunni (Sir) Morningstar and Cael Devo")
                 .put("acquisition", res.quality)
                 .put("stereoPipeline", out?.diagnostics ?: JSONObject.NULL)
                 .put("baselineConfidence", res.baselineConfidence)
+                .put("sensorMetrics", res.sensorMetrics?.toJson() ?: JSONObject.NULL)
+                .put("viewPrediction", lastReveal?.toJson() ?: JSONObject.NULL)
                 .put("scaleStateAtExport", out?.scaleState ?: JSONObject.NULL)
                 .put("baselineMAtExport", out?.baselineM ?: JSONObject.NULL)
                 .put("captureConfidence", res.captureConfidence)

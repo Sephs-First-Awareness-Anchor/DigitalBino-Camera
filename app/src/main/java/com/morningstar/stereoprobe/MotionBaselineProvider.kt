@@ -41,7 +41,7 @@ private const val TAG = "SWEEP"
 /** All thresholds in one place so they can be tuned from exported diagnostics without touching logic. */
 class SweepConfig {
     @Volatile var targetBaselineM = 0.06        // guidance and metric-scale reference, NOT the acceptance test
-    var acceptParallaxPx = 10.0                 // translation-induced parallax (tracking-scale px) required to accept Eye B
+    var acceptParallaxPx = 14.0                 // translation-induced parallax (tracking-scale px) required to accept Eye B (10 gave ~2 cm baselines)
     var rotationToleranceDeg = 5.0
     var minOverlapPct = 60.0                    // of the TEXTURED area of frame A (plain fabric no longer caps the score)
     var minEInliers = 40
@@ -524,12 +524,14 @@ class MotionBaselineProvider(
         val baselineForHud = if (imuTrusted) lateral else -1.0
 
         // Direction of camera motion measured by vision: c = -R^T t in camera-A axes; x is sideways.
-        val visLat: Double = if (m.rotation != null && m.tUnit != null) {
-            val rtv = Mat3.mulVec(Mat3.transpose(m.rotation), m.tUnit)
-            val cv = doubleArrayOf(-rtv[0], -rtv[1], -rtv[2])
-            abs(cv[0]) / max(1e-9, Mat3.norm(cv))
+        // Uses the GYRO-CONSTRAINED pose (stable). The essential-matrix direction flipped between 13% and 78% sideways on real pairs.
+        val gR = m.gyroRotation
+        val gT = m.gyroTUnit
+        val visLat: Double = if (gR != null && gT != null) {
+            val rtv = Mat3.mulVec(Mat3.transpose(gR), gT)
+            abs(rtv[0]) / max(1e-9, Mat3.norm(rtv))
         } else 0.0
-        val visLatOk = m.rotation == null || visLat >= cfg.minVisionLateral
+        val visLatOk = gR == null || visLat >= cfg.minVisionLateral
 
         // Lighting: colour-cycling lights change the scene between the eyes even with exposure and white balance locked.
         val mb = Core.mean(up)
@@ -764,8 +766,12 @@ class MotionBaselineProvider(
             gA.release(); gB.release()
         }
 
-        val rot = vm.rotation
-        val tu = vm.tUnit
+        // Prefer the gyro-constrained pose; fall back to the essential matrix only if the gyro pose fits much worse.
+        val useGyro = vm.gyroRotation != null && vm.gyroTUnit != null &&
+            (vm.eSampsonPx <= 0.0 || vm.gyroSampsonPx <= max(1.5, 2.0 * vm.eSampsonPx))
+        val rot = if (useGyro) vm.gyroRotation else vm.rotation
+        val tu = if (useGyro) vm.gyroTUnit else vm.tUnit
+        val poseMethod = if (useGyro) "GYRO_CONSTRAINED_REFINED" else "ESSENTIAL_MATRIX"
         if (rot == null || tu == null || vm.eInliers < config.minEInliers) {
             clearCandidates(null)
             a.up.release(); a.feats.release()
@@ -776,6 +782,13 @@ class MotionBaselineProvider(
         // Visual baseline direction in camera-A coordinates: c = -R^T t.
         val rt = Mat3.mulVec(Mat3.transpose(rot), tu)
         val cVis = doubleArrayOf(-rt[0], -rt[1], -rt[2])
+        val sidewaysShare = abs(cVis[0]) / max(1e-9, Mat3.norm(cVis))
+        if (sidewaysShare < 0.6) {
+            clearCandidates(null)
+            a.up.release(); a.feats.release()
+            fail("Motion was only ${"%.0f".format(sidewaysShare * 100)}% sideways. Keep the phone's back parallel to the scene and slide straight along a line.")
+            return
+        }
 
         // Drift correction: if the phone was held still at Eye B, true velocity is ~0, so the residual velocity is
         // accumulated bias. Constant bias b gives v_err = bT and p_err = bT^2/2 = v_end*T/2.
@@ -822,6 +835,11 @@ class MotionBaselineProvider(
             .put("rotationSource", sensors.rotationSourceName)
             .put("intrinsics", kUp.toJson())
             .put("poseSource", poseSource)
+            .put("poseMethod", poseMethod)
+            .put("gyroSampsonPx", vm.gyroSampsonPx)
+            .put("essentialSampsonPx", vm.eSampsonPx)
+            .put("gyroRotationNudgeDeg", vm.gyroNudgeDeg)
+            .put("sidewaysShare", sidewaysShare)
             .put("requestedBaselineM", config.targetBaselineM)
             .put("estimatedBaselineM", if (scaleKnown) baseline else JSONObject.NULL)
             .put("scaleKnown", scaleKnown)
@@ -860,9 +878,11 @@ class MotionBaselineProvider(
         val result = StereoAcquisitionResult(
             AcquisitionMethod.MOTION_BASELINE, a.up, best.up, a.tsNs, best.tsNs, kUp,
             rot, tu, baseline, baselineSource, baselineConf, captureConf, q,
-            scaleKnown, scaleSource, focusM, focusCalibration
+            scaleKnown, scaleSource, focusM, focusCalibration,
+            SensorMetrics(relCam, dCam[0], dNorm, focusM, tSec, best.still, tSec <= config.imuTrustSec)
         )
         phase = Phase.DONE
+        Diagnostics.log(TAG, "POSE $poseMethod sideways=${"%.0f".format(sidewaysShare * 100)}% sampson gyro=${"%.2f".format(vm.gyroSampsonPx)}px essential=${"%.2f".format(vm.eSampsonPx)}px nudge=${"%.2f".format(vm.gyroNudgeDeg)}°")
         Diagnostics.log(TAG, "RESULT scale=${if (scaleKnown) "%.1fcm".format(baseline * 100) else "UNSCALED (raw imu %.0fcm)".format(dNorm * 100)} focus=${focusM?.let { "%.2fm".format(it) } ?: "n/a"}/$focusCalibration conf=${"%.2f".format(captureConf)} E=${vm.eInliers} dt=${"%.0f".format(tSec * 1000)}ms still=${best.still}")
         if (!stopped) listener.onResult(result)
     }

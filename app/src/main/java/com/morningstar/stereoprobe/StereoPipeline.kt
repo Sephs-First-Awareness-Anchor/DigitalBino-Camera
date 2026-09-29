@@ -113,7 +113,11 @@ class StereoPipeline(private val params: StereoParams = StereoParams()) {
         }
     }
 
-    private class MatchStats(val dyMedian: Double, val dxMedian: Double, val alignedCount: Int)
+    private class MatchStats(
+        val dyMedian: Double, val dxMedian: Double, val alignedCount: Int,
+        val dxP2: Double = 0.0, val dxP98: Double = 0.0,
+        val centerDx: Double = 0.0, val centerCount: Int = 0
+    )
 
     fun process(res: StereoAcquisitionResult): StereoOutput {
         val t0 = System.nanoTime()
@@ -143,6 +147,10 @@ class StereoPipeline(private val params: StereoParams = StereoParams()) {
         var left = res.first
         var right = res.second
         var rect = rectify(left, right, r, t, kMat, w, h)
+        if (rect.zoom <= 0.15) {
+            rect.release()
+            throw IllegalStateException("Rectification is degenerate (the camera moved mostly toward or away from the scene, not sideways). Capture again by sliding straight sideways.")
+        }
         var stats = matchStats(rect.gl, rect.gr)
         var swapped = false
         var signNote = "left/right order confirmed by measured disparity sign"
@@ -171,7 +179,9 @@ class StereoPipeline(private val params: StereoParams = StereoParams()) {
         val mr = if (params.photometricNormalization) normalizeLocal(rect.gr) else rect.gr.clone()
 
         val bs = if (params.blockSize % 2 == 1) params.blockSize else params.blockSize + 1
-        val nd = max(16, ((params.numDisparities * s / 16.0).toInt() + 1) * 16)
+        // Search range from the disparities actually measured between matched features (fixed 128 saturated on wide baselines).
+        val ndDefault = max(16, ((params.numDisparities * s / 16.0).toInt() + 1) * 16)
+        val nd = if (stats.alignedCount >= 30 && stats.dxP98 > 0.0) max(32, min(256, (((stats.dxP98 * 1.3 + 24.0) / 16.0).toInt() + 1) * 16)) else ndDefault
         val sgbm = StereoSGBM.create(
             0, nd, bs, 8 * bs * bs, 32 * bs * bs, params.disp12MaxDiff, params.preFilterCap,
             params.uniquenessRatio, params.speckleWindow, params.speckleRange, StereoSGBM.MODE_SGBM_3WAY
@@ -212,7 +222,7 @@ class StereoPipeline(private val params: StereoParams = StereoParams()) {
             val v = dispAll[yy * sw + xx]
             if (v > 0.5f) roiVals.add(v.toDouble())
         }
-        val dCenter = if (roiVals.size >= 50) FrameSynchronizer.median(roiVals) else 0.0
+        val dCenter = if (roiVals.size >= 50) FrameSynchronizer.median(roiVals) else if (stats.centerCount >= 8) stats.centerDx else 0.0
         val focusM = res.focusDistanceM
         // B = Z * d / f with Z = the distance the camera focused at and d = disparity of the frame centre (where AF looks).
         val focusBaselineHint = if (focusM != null && dCenter > 0.0) focusM * dCenter / focal else 0.0
@@ -271,6 +281,8 @@ class StereoPipeline(private val params: StereoParams = StereoParams()) {
             .put("leftRightDecision", signNote)
             .put("measuredDisparitySignMedianPx", stats.dxMedian)
             .put("alignedMatchesForSign", stats.alignedCount)
+            .put("featureDisparityP2_P98_px", org.json.JSONArray(listOf(stats.dxP2, stats.dxP98)))
+            .put("adaptiveNumDisparities", nd)
             .put("scaleState", scaleState)
             .put("baselineM_orUnits", baseline)
             .put("baselineSource", res.baselineSource)
@@ -291,6 +303,7 @@ class StereoPipeline(private val params: StereoParams = StereoParams()) {
             .put("numDisparitiesAtMatcherScale", nd)
             .put("blockSize", bs)
             .put("validDisparityFraction", validFraction)
+            .put("validDisparityFractionOfUsableArea", validFraction / max(1e-6, validAreaFraction))
             .put("disparityMinPx", dMin).put("disparityMaxPx", dMax)
             .put("rectifiedEpipolarErrorMedianPx", epiErr)
             .put("reconstructionConfidence", confidence)
@@ -301,7 +314,7 @@ class StereoPipeline(private val params: StereoParams = StereoParams()) {
                 .put("total", (tEnd - t0) / 1e6))
         Diagnostics.log(
             TAG,
-            "valid=${"%.0f".format(validFraction * 100)}% epipolarErr=${"%.2f".format(epiErr)}px dispSign=${"%.1f".format(stats.dxMedian)}px " +
+            "valid=${"%.0f".format(100 * validFraction / max(1e-6, validAreaFraction))}%ofUsable epipolarErr=${"%.2f".format(epiErr)}px dispSign=${"%.1f".format(stats.dxMedian)}px " +
                 "swapped=$swapped rectRot=(${"%.1f".format(rect.r1Deg)},${"%.1f".format(rect.r2Deg)})° zoom=${"%.2f".format(rect.zoom)} " +
                 "scale=$scaleState ${if (scaleState == "UNSCALED") "(relative)" else "%.1fcm".format(baseline * 100)} focusHint=${"%.1fcm".format(focusBaselineHint * 100)} total=${"%.0f".format((tEnd - t0) / 1e6)}ms"
         )
@@ -400,6 +413,8 @@ class StereoPipeline(private val params: StereoParams = StereoParams()) {
         orb.detectAndCompute(gl, Mat(), kpL, dL)
         orb.detectAndCompute(gr, Mat(), kpR, dR)
         if (dL.empty() || dR.empty()) return MatchStats(99.0, 0.0, 0)
+        val cw = gl.cols().toDouble()
+        val ch = gl.rows().toDouble()
         val matcher = DescriptorMatcher.create(DescriptorMatcher.BRUTEFORCE_HAMMING)
         val knn = ArrayList<MatOfDMatch>()
         matcher.knnMatch(dL, dR, knn, 2)
@@ -407,6 +422,7 @@ class StereoPipeline(private val params: StereoParams = StereoParams()) {
         val b = kpR.toArray()
         val dys = ArrayList<Double>()
         val dxs = ArrayList<Double>()
+        val centerDxs = ArrayList<Double>()
         for (m in knn) {
             val arr = m.toArray()
             if (arr.size >= 2 && arr[0].distance < 0.75f * arr[1].distance) {
@@ -414,13 +430,20 @@ class StereoPipeline(private val params: StereoParams = StereoParams()) {
                 val pr = b[arr[0].trainIdx].pt
                 val dy = abs(pl.y - pr.y)
                 if (dy < 15.0) dys.add(dy)
-                if (dy < 4.0) dxs.add(pl.x - pr.x)
+                if (dy < 4.0) {
+                    dxs.add(pl.x - pr.x)
+                    if (abs(pl.x - cw / 2) < cw * 0.15 && abs(pl.y - ch / 2) < ch * 0.15) centerDxs.add(pl.x - pr.x)
+                }
             }
             m.release()
         }
         kpL.release(); kpR.release(); dL.release(); dR.release()
         val dyMed = if (dys.size < 10) 99.0 else FrameSynchronizer.median(dys)
         val dxMed = if (dxs.size < 10) 0.0 else FrameSynchronizer.median(dxs)
-        return MatchStats(dyMed, dxMed, dxs.size)
+        val sorted = dxs.sorted()
+        val p2 = if (sorted.size >= 10) sorted[(sorted.size * 0.02).toInt()] else 0.0
+        val p98 = if (sorted.size >= 10) sorted[min(sorted.size - 1, (sorted.size * 0.98).toInt())] else 0.0
+        val cMed = if (centerDxs.size >= 8) FrameSynchronizer.median(centerDxs) else 0.0
+        return MatchStats(dyMed, dxMed, dxs.size, p2, p98, cMed, centerDxs.size)
     }
 }

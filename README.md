@@ -107,3 +107,40 @@ smoothly from wall (10 px) to plush (18 px) to legs (36 px), 89% sideways motion
 - Vision-based "slide straight, do not arc" gate; colour-cycling lights trigger a warning.
 Verified: compiles against android-34 + OpenCV 4.9.0; overlap metric replayed on the real pair; normalisation tested on synthetic pairs.
 Not verified on device: the new scale UI, the focus-distance anchor, the new rectification defaults.
+
+
+## v0.3.0 (from the 02:23-02:26 runs)
+Findings from seven captures: 4 rectified, 2 were refused as "not mostly horizontal", 1 was degenerate. Root cause: the direction of camera
+motion recovered from the essential matrix is UNSTABLE when the baseline is small compared with scene depth (on one real pair it read 13% sideways
+at 540x720 and 78% at 1080x1440; the app's own runs disagreed with offline re-runs of the same pair).
+- **Gyro-constrained pose** (`GyroPoseSolver.kt`, pure Kotlin): rotation held at the game-rotation-vector value, translation direction solved
+  linearly (smallest eigenvector, robust reweighting, cheirality sign), then a sub-degree rotation nudge by pattern search on Sampson error.
+  On the three real pairs it gave 98-100% sideways, epipolar error 0.32-0.45 px (the free essential-matrix fit was 0.48-0.52 px) and clean
+  rectification (413-556 row-aligned matches, 0.76-1.04 px RMS). The Kotlin solver was verified on a JVM against a Python reference on the same data.
+  It now drives the in-sweep "slide straight" gate and the final pose. The essential-matrix pose is kept as a fallback and for diagnostics
+  (`poseMethod`, `gyroSampsonPx`, `essentialSampsonPx` in the export).
+- Non-sideways sweeps are refused with the measured percentage instead of producing a degenerate rectification.
+- Disparity search range is now adaptive (from measured feature disparities); the fixed range saturated on wide baselines.
+- Degenerate rectification (zoom <= 0.15) is reported as such.
+- `acceptParallaxPx` raised from 10 to 14 to get a larger baseline.
+- The camera reports `LENS_INFO_FOCUS_DISTANCE_CALIBRATION = CALIBRATED`, so the focus-distance scale anchor is used. Offline, dense disparity at the
+  focused centre gave baselines of 5.2 / 6.4 / 6.1 cm for three sweeps (consistent, near the 6 cm aimed for).
+  Correction: an earlier estimate of 1-2 cm was biased by feature-only disparities (the plush face has no texture, so features sit on the far background).
+Verified offline on real pairs: pose solver, rectification, SGBM vs feature disparity agreement (median 0.59 px). Not yet run on the phone: the new build.
+
+
+## v0.4.0: the app guesses Eye B before seeing it ("Guess B")
+After each sweep the app builds a guess for Eye B from **Eye A + sensor metrics only**, THEN reveals the real Eye B, scores itself, and learns.
+- **No borrowed model.** The model is exact projective geometry plus a small depth prior the app fits to its own captures
+  (`ViewSynth.kt`: 7 weights, Nelder-Mead with a pull toward a neutral prior, replay buffer of the last 30 captures, stored in the app's private
+  `view_predictor.json`). Delete the app's data to reset learning.
+- **No leakage.** `ViewPredictor.predict(eyeA, intrinsics, sensorMetrics)` is never given Eye B. `SensorMetrics` holds only gyro rotation, accelerometer
+  displacement, focus distance and timing. The visually estimated pose is excluded on purpose (it is computed by matching A against B).
+- **Scoreboard** (Guess B / Error buttons; also in the export): median feature-position error of the guess vs two honest baselines
+  (gyro-rotation-only, and no change) plus an image error in local-contrast units, and a trend over the last captures.
+- **Sensor-sign check.** If flipping the accelerometer direction makes the guess much better, that capture is flagged and learned with the corrected sign.
+Known limits: baseline error and depth level multiply, so they cannot be separated from one capture (weight 0 absorbs both);
+lighting changes between eyes (colour-cycling LEDs) cannot be predicted by geometry; the guess inpaints disocclusions;
+learning from a handful of captures of one room will not generalise to other places; the image-error metric is weakly discriminative.
+Verified offline on three real pairs: Kotlin geometry reproduces the Python prototype exactly; prior fitted on two captures predicted the third
+(sign corrected) to 10.5 px vs 25.2 px for gyro-only. Not yet run on the phone.

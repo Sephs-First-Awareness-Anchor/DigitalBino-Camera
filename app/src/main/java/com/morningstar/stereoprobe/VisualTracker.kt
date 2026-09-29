@@ -50,9 +50,14 @@ class VisualMetrics(
     val parallaxVisRotPx: Double,
     val parallaxImuRotPx: Double,
     val flowMedianPx: Double,
-    val rotation: DoubleArray?,
+    val rotation: DoubleArray?,             // essential-matrix pose (unstable when the baseline is small vs scene depth)
     val tUnit: DoubleArray?,
-    val imuVisRotDisagreementDeg: Double
+    val imuVisRotDisagreementDeg: Double,
+    val gyroRotation: DoubleArray? = null,  // pose with the gyro rotation held (plus a sub-degree nudge): stable
+    val gyroTUnit: DoubleArray? = null,
+    val gyroSampsonPx: Double = 0.0,        // median epipolar error of the gyro-constrained pose
+    val eSampsonPx: Double = 0.0,           // median epipolar error of the essential-matrix pose
+    val gyroNudgeDeg: Double = 0.0
 ) {
     companion object {
         val EMPTY = VisualMetrics(0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, null, null, 0.0)
@@ -134,7 +139,11 @@ class VisualTracker(nFeatures: Int = 1500) {
         if (eAll.empty() || eAll.rows() < 3) {
             p1.release(); p2.release(); kMat.release(); mask.release(); eAll.release()
             val par = if (imuRotCam != null) FrameSynchronizer.median(resid.toList()) else 0.0
-            return VisualMetrics(n, 0, 0, overlapC, consistentPct, 0.0, par, flowMedian, null, null, 0.0)
+            val gp0 = gyroPoseFor(pa, pb, keepC, k, imuRotCam)
+            return VisualMetrics(
+                n, 0, 0, overlapC, consistentPct, 0.0, par, flowMedian, null, null, 0.0,
+                gp0?.rotation, gp0?.tUnit, gp0?.sampsonPx ?: 0.0, 0.0, gp0?.nudgeDeg ?: 0.0
+            )
         }
         val e = eAll.rowRange(0, 3).clone()
 
@@ -165,12 +174,43 @@ class VisualTracker(nFeatures: Int = 1500) {
         val imuRes = if (imuRotCam != null) FrameSynchronizer.median((0 until n).filter { keepE[it] }.map { resid[it] }) else 0.0
         val disagreement = if (poseOk && imuRotCam != null) Mat3.angleDeg(Mat3.mul(Mat3.transpose(rArr), imuRotCam)) else 0.0
 
+        // Gyro-constrained pose (stable) on the essential-matrix inliers if there are enough, else the rotation-consistent matches.
+        val geomSet = if (eInliers >= 30) keepE else keepC
+        val gp = gyroPoseFor(pa, pb, geomSet, k, imuRotCam)
+        val eSamp = if (poseOk) sampsonOf(pa, pb, geomSet, k, rArr, tArr) else 0.0
+
         p1.release(); p2.release(); kMat.release(); mask.release(); poseMask.release(); tri.release()
         eAll.release(); e.release(); rMat.release(); tMat.release()
         return VisualMetrics(
             n, eInliers, poseInliers, max(overlapE, overlapC), consistentPct,
-            visRes, imuRes, flowMedian, if (poseOk) rArr else null, if (poseOk) tArr else null, disagreement
+            visRes, imuRes, flowMedian, if (poseOk) rArr else null, if (poseOk) tArr else null, disagreement,
+            gp?.rotation, gp?.tUnit, gp?.sampsonPx ?: 0.0, eSamp, gp?.nudgeDeg ?: 0.0
         )
+    }
+
+    private fun gyroPoseFor(pa: List<Point>, pb: List<Point>, keep: BooleanArray, k: Intrinsics, imuRotCam: DoubleArray?): GyroPoseSolver.Result? {
+        if (imuRotCam == null) return null
+        val idx = keep.indices.filter { keep[it] }
+        if (idx.size < 30) return null
+        val a = DoubleArray(idx.size * 2)
+        val b = DoubleArray(idx.size * 2)
+        for ((j, i) in idx.withIndex()) {
+            a[2 * j] = pa[i].x; a[2 * j + 1] = pa[i].y
+            b[2 * j] = pb[i].x; b[2 * j + 1] = pb[i].y
+        }
+        return GyroPoseSolver.solve(a, b, k.fx, k.fy, k.cx, k.cy, imuRotCam, true)
+    }
+
+    private fun sampsonOf(pa: List<Point>, pb: List<Point>, keep: BooleanArray, k: Intrinsics, r: DoubleArray, t: DoubleArray): Double {
+        val idx = keep.indices.filter { keep[it] }
+        if (idx.size < 20) return 0.0
+        val x1 = DoubleArray(idx.size * 3)
+        val x2 = DoubleArray(idx.size * 3)
+        for ((j, i) in idx.withIndex()) {
+            x1[3 * j] = (pa[i].x - k.cx) / k.fx; x1[3 * j + 1] = (pa[i].y - k.cy) / k.fy; x1[3 * j + 2] = 1.0
+            x2[3 * j] = (pb[i].x - k.cx) / k.fx; x2[3 * j + 1] = (pb[i].y - k.cy) / k.fy; x2[3 * j + 2] = 1.0
+        }
+        return GyroPoseSolver.sampsonMedian(x1, x2, idx.size, r, t, k.fx)
     }
 
     /**
