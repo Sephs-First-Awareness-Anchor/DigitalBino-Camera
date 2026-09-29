@@ -38,3 +38,41 @@ Timestamps are driver-reported; the report never claims hardware sync it did not
 ## Not built yet (later phases)
 Dual live view UI, paired-capture gallery, recording, OpenCV calibration/rectification/disparity/depth.
 Each should wait for the evidence this probe produces.
+
+
+---
+
+# Bino Sweep (motion-baseline binocular capture)
+Button **5 · BINO SWEEP** on the main screen. One rear camera stays open and streaming; you slide the phone sideways.
+
+## Flow
+1. Frame the subject, press **CAPTURE**: Eye A locks (exposure, white balance and focus lock with it).
+2. A translucent ghost of Eye A overlays the live view. Slide the phone right, keeping its orientation.
+3. The HUD shows baseline progress, pitch/yaw/roll, overlap, inliers and parallax.
+4. Eye B is chosen automatically from a rolling candidate buffer, with a haptic confirmation.
+5. Relative pose is estimated, the pair is rectified, disparity and depth are computed.
+6. Result viewer: Eye A / Eye B / Rect (with guide lines) / Disp / Depth. Tap Disp or Depth for distance. **Export** saves PNGs + diagnostics JSON to Downloads/StereoProbe.
+
+## Architecture
+- `StereoAcquisition.kt`: `StereoAcquisitionProvider`, `StereoAcquisitionResult`, `AcquisitionSelector`. Concurrent provider is a future slot.
+- `MotionBaselineProvider.kt`: camera, sweep state machine, gating, candidate buffer.
+- `MotionSensors.kt`, `VisualTracker.kt`: IMU and feature tracking (each constrains the other).
+- `StereoPipeline.kt`: rectification, SGBM disparity, depth. Never asks how the pair was obtained.
+- `SweepActivity.kt`: UI only.
+
+## What "genuine translation" means here
+Rotation-only motion is fully explained by a homography, so the median residual after rotation compensation is about 0 for a pivot
+and depth-dependent for a slide. Eye B is refused unless that parallax residual, IMU baseline, orientation, overlap, inliers, sharpness and exposure all pass.
+
+## Verification status (be honest about it)
+- Compiles with kotlinc 1.9.24 against android-34 android.jar and OpenCV 4.9.0 classes.
+- Pose conventions verified on a synthetic scene with known motion (direction recovery, left/right swap, rectification, depth, pivot-vs-slide residual).
+- NOT yet run through Gradle or on a handset.
+
+## Known limits / still unverified on hardware
+- **Metric scale is the weak point.** Direction comes from vision; magnitude comes from double-integrating the accelerometer, which drifts.
+  Structure is reliable before scale is. The export reports IMU-vs-vision direction agreement as baseline confidence.
+- Rotation hint wording ("tilt down", "rotate right") is derived from axis conventions, not yet confirmed on the phone.
+- Intrinsics are derived from focal length + sensor size (no calibration, no distortion model).
+- Moving subjects are only detected as "scene changed too much"; they are not masked yet.
+- All thresholds live in `SweepConfig` so they can be tuned from exported diagnostics.

@@ -14,7 +14,11 @@ android {
         minSdk = 30
         targetSdk = 34
         versionCode = 1
-        versionName = "0.1.0-probe"
+        versionName = "0.2.0-sweep"
+        // OpenCV ships native libraries per ABI; the A16 is arm64.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     buildTypes {
@@ -30,4 +34,9 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+dependencies {
+    // OpenCV 4.9.0 official Android SDK (Java API + native libs) from Maven Central.
+    implementation("org.opencv:opencv:4.9.0")
 }

@@ -112,6 +112,9 @@ class MainActivity : Activity() {
         root.addView(button("2 · TEST ALL CAMERA PAIRS") { doTestPairs() })
         root.addView(button("3 · FLIP TEST (sequential, NOT stereo)") { doFlipTest() })
         root.addView(button("3b · HOLD / SUSPEND + FAST FLIP TEST") { doHoldTest() })
+        root.addView(button("5 · BINO SWEEP (single-camera motion stereo)") {
+            startActivity(Intent(this, SweepActivity::class.java))
+        })
         root.addView(button("4 · EXPORT REPORT (JSON + TXT) & SHARE") { doExport() })
 
         scroll = ScrollView(this)
@@ -198,6 +201,7 @@ class MainActivity : Activity() {
         deviceSummary = dp.deviceSummary(d)
         val p = dp.probeCameras()
         probe = p
+        AppState.probe = p
         run = null
         flips.clear()
         holds.clear()
@@ -216,6 +220,7 @@ class MainActivity : Activity() {
             val coord = CameraCoordinator(applicationContext, p)
             try {
                 run = coord.testAll { step -> Diagnostics.setState("PAIR TEST: $step") }
+                AppState.run = run
             } finally {
                 coord.shutdown()
             }
