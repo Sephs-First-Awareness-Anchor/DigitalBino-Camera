@@ -33,7 +33,8 @@ class Prediction(
     val weightsUsed: DoubleArray,
     val metrics: SensorMetrics,
     val cam: ViewSynth.Cam,
-    val scale: Double
+    val scale: Double,
+    val policy: String                  // INSTRUCTED (slide right by the requested baseline) or IMU (signed accelerometer displacement)
 ) {
     fun release() { guess.release(); validMask.release() }
 }
@@ -47,7 +48,11 @@ class Reveal(
     val learnedFromCaptures: Int,
     val weightsBefore: DoubleArray, val weightsAfter: DoubleArray,
     val trend: String,
-    val errorImage: Mat
+    val errorImage: Mat,
+    val policyUsed: String = "",
+    val instructedPx: Double = Double.NaN,
+    val imuPx: Double = Double.NaN,
+    val userSlidLeft: Boolean = false
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("correspondencesUsed", nPoints)
@@ -57,6 +62,8 @@ class Reveal(
         .put("photometricError_noChange", photoNoChange)
         .put("guessCoverage", coverage)
         .put("accelerometerSignLikelyWrong", signLikelyWrong)
+        .put("policyUsed", policyUsed).put("featureErrorPx_instructedPolicy", instructedPx)
+        .put("featureErrorPx_imuPolicy", imuPx).put("userSlidLeft", userSlidLeft)
         .put("learnedFromCaptures", learnedFromCaptures)
         .put("weightsBefore", JSONArray(weightsBefore.toList())).put("weightsAfter", JSONArray(weightsAfter.toList()))
 
@@ -65,6 +72,8 @@ class Reveal(
         sb.append("Feature error (px, lower is better):\n  guess ${"%.1f".format(guessPx)}   gyro-only ${"%.1f".format(gyroOnlyPx)}   no change ${"%.1f".format(noChangePx)}\n")
         sb.append("Image error (local-contrast units):\n  guess ${"%.2f".format(photoGuess)}   gyro-only ${"%.2f".format(photoGyroOnly)}   no change ${"%.2f".format(photoNoChange)}\n")
         sb.append("Guess filled ${"%.0f".format(coverage * 100)}% from real pixels; the rest is inpainted\n")
+        sb.append("Direction policy used: $policyUsed  (instructed ${"%.1f".format(instructedPx)} px, accelerometer ${"%.1f".format(imuPx)} px)\n")
+        if (userSlidLeft) sb.append("You slid LEFT this time; learned with the left direction\n")
         if (signLikelyWrong) sb.append("Accelerometer direction looked WRONG this time (flipped-sign guess: ${"%.1f".format(flippedSignGuessPx)} px); that capture was learned with the corrected sign\n")
         sb.append("Learned from $learnedFromCaptures capture${if (learnedFromCaptures == 1) "" else "s"}\n")
         if (trend.isNotEmpty()) sb.append(trend)
@@ -78,8 +87,16 @@ class PredictorStore(context: Context) {
     var w: DoubleArray = ViewSynth.FLAT_PRIOR.copyOf()
     val samples = ArrayList<ViewSynth.Sample>()
     val history = ArrayList<JSONObject>()
+    val policyErrors = hashMapOf("INSTRUCTED" to ArrayList<Double>(), "IMU" to ArrayList<Double>())
 
     init { load() }
+
+    /** Which way of getting the camera's sideways movement predicts better? Decided by the last few captures; starts with the instruction. */
+    fun choosePolicy(): String {
+        fun med(k: String): Double { val l = policyErrors[k]!!.takeLast(8); return if (l.size < 2) Double.NaN else GyroPoseSolver.median(l.toDoubleArray()) }
+        val i = med("INSTRUCTED"); val m = med("IMU")
+        return if (!i.isNaN() && !m.isNaN() && m < 0.8 * i) "IMU" else "INSTRUCTED"
+    }
 
     private fun load() {
         try {
@@ -92,6 +109,10 @@ class PredictorStore(context: Context) {
                 val s = sa.getJSONObject(i)
                 fun arr(name: String): DoubleArray { val a = s.getJSONArray(name); return DoubleArray(a.length()) { a.getDouble(it) } }
                 samples.add(ViewSynth.Sample(arr("a"), arr("b"), s.getDouble("focus"), arr("rot"), arr("c")))
+            }
+            for (k in listOf("INSTRUCTED", "IMU")) {
+                val pa = j.optJSONArray("policy_$k")
+                if (pa != null) for (i in 0 until pa.length()) policyErrors[k]!!.add(pa.getDouble(i))
             }
             val ha = j.getJSONArray("history")
             for (i in 0 until ha.length()) history.add(ha.getJSONObject(i))
@@ -112,6 +133,7 @@ class PredictorStore(context: Context) {
                     .put("focus", s.focusM).put("rot", JSONArray(s.rot.toList())).put("c", JSONArray(s.c.toList())))
             }
             j.put("samples", sa)
+            for (k in listOf("INSTRUCTED", "IMU")) j.put("policy_$k", JSONArray(policyErrors[k]!!.takeLast(60)))
             val ha = JSONArray(); history.takeLast(100).forEach { ha.put(it) }
             j.put("history", ha)
             file.writeText(j.toString())
@@ -121,7 +143,7 @@ class PredictorStore(context: Context) {
     }
 
     fun reset() {
-        w = ViewSynth.FLAT_PRIOR.copyOf(); samples.clear(); history.clear(); save()
+        w = ViewSynth.FLAT_PRIOR.copyOf(); samples.clear(); history.clear(); policyErrors.values.forEach { it.clear() }; save()
     }
 
     fun trendText(): String {
@@ -144,7 +166,9 @@ class ViewPredictor(context: Context) {
         val cam = ViewSynth.Cam(k.fx, k.fy, k.cx, k.cy, k.width.toDouble(), k.height.toDouble())
         val scale = 0.5
         val focus = m.focusDistanceM ?: 0.8
-        val c = doubleArrayOf(m.imuLateralM, 0.0, 0.0)          // lateral accelerometer displacement only (the app asks for a sideways slide)
+        val policy = store.choosePolicy()
+        // The app asks for a rightward slide, so the camera-B centre is +x. Magnitude: the requested baseline, or the accelerometer's value.
+        val c = if (policy == "IMU") doubleArrayOf(m.imuLateralM, 0.0, 0.0) else doubleArrayOf(m.targetBaselineM, 0.0, 0.0)
         val w = store.w.copyOf()
 
         val small = Mat()
@@ -198,8 +222,8 @@ class ViewPredictor(context: Context) {
         val filled = Mat()
         Photo.inpaint(guess, holes, filled, 3.0, Photo.INPAINT_TELEA)
         small.release(); guess.release(); holes.release()
-        Diagnostics.log(TAG, "guess for B built from eye A + sensors only: focus=${"%.2f".format(focus)}m lateral=${"%.1f".format(m.imuLateralM * 100)}cm coverage=${"%.0f".format(coverage * 100)}% w=${w.joinToString(",") { "%.2f".format(it) }}")
-        return Prediction(filled, valid, coverage, w, m, cam, scale)
+        Diagnostics.log(TAG, "guess for B built from eye A + sensors only: policy=$policy focus=${"%.2f".format(focus)}m lateral=${"%.1f".format(m.imuLateralM * 100)}cm coverage=${"%.0f".format(coverage * 100)}% w=${w.joinToString(",") { "%.2f".format(it) }}")
+        return Prediction(filled, valid, coverage, w, m, cam, scale, policy)
     }
 
     /** Eye B is revealed HERE, after the guess exists. Scores the guess, then teaches the model. */
@@ -208,8 +232,15 @@ class ViewPredictor(context: Context) {
         val m = pred.metrics
         val focus = m.focusDistanceM ?: 0.8
         val (a, b) = correspondences(eyeA, eyeB)
-        val c = doubleArrayOf(m.imuLateralM, 0.0, 0.0)
+        val c = if (pred.policy == "IMU") doubleArrayOf(m.imuLateralM, 0.0, 0.0) else doubleArrayOf(m.targetBaselineM, 0.0, 0.0)
         val sample = ViewSynth.Sample(a, b, focus, m.gyroRotationCam, c)
+        val instrS = ViewSynth.Sample(a, b, focus, m.gyroRotationCam, doubleArrayOf(m.targetBaselineM, 0.0, 0.0))
+        val instrLeftS = ViewSynth.Sample(a, b, focus, m.gyroRotationCam, doubleArrayOf(-m.targetBaselineM, 0.0, 0.0))
+        val imuS = ViewSynth.Sample(a, b, focus, m.gyroRotationCam, doubleArrayOf(m.imuLateralM, 0.0, 0.0))
+        val instrPx = if (a.size >= 40) ViewSynth.medianError(ViewSynth.predictPoints(instrS, pred.weightsUsed, cam), b) else Double.NaN
+        val instrLeftPx = if (a.size >= 40) ViewSynth.medianError(ViewSynth.predictPoints(instrLeftS, pred.weightsUsed, cam), b) else Double.NaN
+        val imuPolicyPx = if (a.size >= 40) ViewSynth.medianError(ViewSynth.predictPoints(imuS, pred.weightsUsed, cam), b) else Double.NaN
+        val userSlidLeft = a.size >= 40 && instrLeftPx < 0.6 * instrPx && instrPx > 8.0
         val flipped = ViewSynth.Sample(a, b, focus, m.gyroRotationCam, doubleArrayOf(-c[0], 0.0, 0.0))
 
         val guessPx = if (a.size >= 40) ViewSynth.medianError(ViewSynth.predictPoints(sample, pred.weightsUsed, cam), b) else Double.NaN
@@ -261,14 +292,17 @@ class ViewPredictor(context: Context) {
         val wBefore = store.w.copyOf()
         var learned = store.samples.size
         if (a.size >= 80) {
-            val train = if (signWrong) flipped else sample
+            // Train with the requested magnitude and whichever direction actually fits (the accelerometer's own sign is not trusted for learning).
+            val train = if (userSlidLeft) instrLeftS else instrS
             store.samples.add(subsample(train, 400))
             while (store.samples.size > 30) store.samples.removeAt(0)
             store.w = ViewSynth.fit(store.samples, ViewSynth.FLAT_PRIOR, cam, 4.0, store.w)
             learned = store.samples.size
         }
+        if (!instrPx.isNaN() && !userSlidLeft) store.policyErrors["INSTRUCTED"]!!.add(instrPx)
+        if (!imuPolicyPx.isNaN()) store.policyErrors["IMU"]!!.add(imuPolicyPx)
         store.history.add(
-            JSONObject().put("t", System.currentTimeMillis())
+            JSONObject().put("t", System.currentTimeMillis()).put("policy", pred.policy)
                 .put("guessPx", guessPx).put("gyroOnlyPx", gyroPx).put("noChangePx", idPx)
                 .put("photoGuess", photoGuess).put("signWrong", signWrong).put("n", a.size / 2)
         )
@@ -279,7 +313,8 @@ class ViewPredictor(context: Context) {
         for (mat in listOf(bSmall, aSmall, gB, gGuess, gA, validErode, all, kS, kInv, rM, tmp, hM, gWarp, mWarp, diff, diff4, holes, kernel)) mat.release()
         return Reveal(
             a.size / 2, guessPx, gyroPx, idPx, flipPx, photoGuess, photoGyro, photoNo, pred.coverage,
-            signWrong, learned, wBefore, store.w.copyOf(), trend, errColor
+            signWrong, learned, wBefore, store.w.copyOf(), trend, errColor,
+            pred.policy, instrPx, imuPolicyPx, userSlidLeft
         )
     }
 

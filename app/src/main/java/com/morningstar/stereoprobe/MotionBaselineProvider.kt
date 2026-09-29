@@ -512,7 +512,7 @@ class MotionBaselineProvider(
         if (sweepSign == 0 && abs(lateralRaw) >= 0.012) sweepSign = if (lateralRaw > 0) 1 else -1
         val dirSign = if (sweepSign == 0) 1 else sweepSign
         val lateral = lateralRaw * dirSign
-        val dirWord = if (dirSign > 0) "right" else "left"
+        val dirWord = "right"   // fixed instruction; the accelerometer sign proved unreliable over a ~3 s slide
         val target = cfg.targetBaselineM
 
         val fb = tracker.describe(gray)
@@ -879,7 +879,7 @@ class MotionBaselineProvider(
             AcquisitionMethod.MOTION_BASELINE, a.up, best.up, a.tsNs, best.tsNs, kUp,
             rot, tu, baseline, baselineSource, baselineConf, captureConf, q,
             scaleKnown, scaleSource, focusM, focusCalibration,
-            SensorMetrics(relCam, dCam[0], dNorm, focusM, tSec, best.still, tSec <= config.imuTrustSec)
+            SensorMetrics(relCam, dCam[0], dNorm, focusM, tSec, best.still, tSec <= config.imuTrustSec, config.targetBaselineM)
         )
         phase = Phase.DONE
         Diagnostics.log(TAG, "POSE $poseMethod sideways=${"%.0f".format(sidewaysShare * 100)}% sampson gyro=${"%.2f".format(vm.gyroSampsonPx)}px essential=${"%.2f".format(vm.eSampsonPx)}px nudge=${"%.2f".format(vm.gyroNudgeDeg)}°")

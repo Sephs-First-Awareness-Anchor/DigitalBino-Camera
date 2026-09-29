@@ -144,3 +144,19 @@ lighting changes between eyes (colour-cycling LEDs) cannot be predicted by geome
 learning from a handful of captures of one room will not generalise to other places; the image-error metric is weakly discriminative.
 Verified offline on three real pairs: Kotlin geometry reproduces the Python prototype exactly; prior fitted on two captures predicted the third
 (sign corrected) to 10.5 px vs 25.2 px for gyro-only. Not yet run on the phone.
+
+
+## v0.4.1: Guess B, first cross-room test (kitchen) and the direction-policy fix
+Kitchen captures (door with sign, stove with figurines), prior trained only in the attic. Measured from the exported images
+(guess-vs-real-B residual, 540x720 px): door 3.0 px vs 15.7 px for "no change" (5x closer); stove 24.9 px vs 15.1 px (WORSE than nothing).
+Cause on the stove capture: the guess moved features the OPPOSITE way to the real motion (-69% of the real shift). The accelerometer's sign was wrong in
+2 of 5 measured captures (over a ~3 s slide its drift exceeds a few centimetres of real motion), while every real slide was rightward as instructed.
+- The predictor now has two direction/magnitude policies: INSTRUCTED (slide right by the requested baseline) and IMU (signed accelerometer displacement).
+  Both are scored on every capture; the one with the lower recent median error is used (starts with INSTRUCTED). Persisted in the store.
+- Learning uses the requested magnitude and whichever direction actually fits (also detects a slide to the left), not the accelerometer's sign.
+- The on-screen instruction is a fixed "Slide phone right".
+Offline evidence: attic leave-one-out, IMU policy 30.8 px mean vs INSTRUCTED policy 5.7 px mean (gyro-only ~24, no change ~41).
+Indicative cross-room test (prior trained only in the attic, rotation assumed 0, focus distance unknown): kitchen door 10.6-11.6 px and stove 10.5-12.3 px
+for focus 0.6-1.0 m, vs ~31 px for no change and 34-100 px for a flat prior.
+Caveats: kitchen numbers come from images only (that export was a fresh session, so no sweep log); depth range in the stove scene is small compared with the
+baseline, so its depth map is nearly flat; export the report BEFORE closing the app so REVEAL lines are included.

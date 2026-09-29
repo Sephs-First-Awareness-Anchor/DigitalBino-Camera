@@ -123,13 +123,15 @@ class SensorMetrics(
     val focusDistanceM: Double?,        // camera-reported focus distance
     val sweepSeconds: Double,
     val heldStill: Boolean,
-    val imuTrusted: Boolean
+    val imuTrusted: Boolean,
+    val targetBaselineM: Double = 0.06   // the baseline the screen asked for ("slide right"), known before eye B
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("gyroRotationCam", org.json.JSONArray(gyroRotationCam.toList()))
         .put("imuLateralM", imuLateralM).put("imuTotalM", imuTotalM)
         .put("focusDistanceM", focusDistanceM ?: JSONObject.NULL)
         .put("sweepSeconds", sweepSeconds).put("heldStill", heldStill).put("imuTrusted", imuTrusted)
+        .put("targetBaselineM", targetBaselineM)
 }
 
 class SweepStatus(
