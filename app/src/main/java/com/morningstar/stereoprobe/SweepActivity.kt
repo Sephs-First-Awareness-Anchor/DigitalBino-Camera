@@ -212,7 +212,12 @@ class SweepActivity : Activity(), SweepListener {
         provider?.setTargetBaselineCm(targetCm)
     }
 
+    private var lastResetMs = 0L
+
     private fun resetAll() {
+        val now = System.currentTimeMillis()
+        if (now - lastResetMs < 1500) return
+        lastResetMs = now
         output?.release(); output = null
         result?.release(); result = null
         bitmaps.clear()
@@ -235,15 +240,16 @@ class SweepActivity : Activity(), SweepListener {
             hud.setTextColor(if (status.orientationOk) Color.WHITE else Color.rgb(255, 200, 80))
             progress.text = if (eyeALocked) {
                 val n = 12
-                val frac = (status.baselineCm / status.targetCm).coerceIn(0.0, 1.0)
+                val frac = status.progress.coerceIn(0.0, 1.0)
                 val pos = (frac * n).toInt()
                 val bar = StringBuilder("Eye A ●")
                 for (i in 0 until n) bar.append(if (i == pos) '◦' else '─')
                 bar.append("○ Eye B")
-                bar.toString() + "\n${"%.1f".format(status.baselineCm)} cm / ${"%.1f".format(status.targetCm)} cm" +
-                    "   overlap ${"%.0f".format(status.overlapPct)}%" +
+                bar.toString() + "\nparallax ${"%.1f".format(status.parallaxPx)} / ${"%.0f".format(status.parallaxTargetPx)} px" +
+                    "   ≈${"%.1f".format(status.baselineCm)} cm by sensors (coarse)" +
+                    "\noverlap ${"%.0f".format(status.overlapPct)}%" +
                     "\npitch ${"%.1f".format(status.pitchDeg)}°  yaw ${"%.1f".format(status.yawDeg)}°  roll ${"%.1f".format(status.rollDeg)}°" +
-                    "   inliers ${status.inliers}  parallax ${"%.1f".format(status.parallaxPx)}px"
+                    "   geometry inliers ${status.inliers}"
             } else ""
         }
     }

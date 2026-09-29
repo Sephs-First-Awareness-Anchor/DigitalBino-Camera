@@ -76,3 +76,16 @@ and depth-dependent for a slide. Eye B is refused unless that parallax residual,
 - Intrinsics are derived from focal length + sensor size (no calibration, no distortion model).
 - Moving subjects are only detected as "scene changed too much"; they are not masked yet.
 - All thresholds live in `SweepConfig` so they can be tuned from exported diagnostics.
+
+
+## v0.2.1 fixes (from the first on-device Bino Sweep log)
+All eight attempts failed with "Scene changed too much". The log showed this was my code, not the scene:
+- `recoverPose` silently discards points farther than ~50 baselines (about 2.5 m for a 5 cm slide). Overlap, pose-inlier count and the
+  scene-changed test were all computed from that starved set. Now: far-point rejection disabled, geometry judged by essential-matrix inliers,
+  overlap from the larger of two hulls, and "scene changed" requires matches to be wrong everywhere (rotation-inconsistent AND no epipolar structure).
+- Integrated accelerometer displacement drifted to 5 cm with almost no sideways motion. Acceptance is now decided by measured PARALLAX (vision),
+  progress bar and HUD use parallax, and IMU centimetres are labelled coarse. Drift correction (zero-velocity update) is applied when held still at Eye B.
+- Rotation source is now the game rotation vector (gyro + accelerometer, no magnetometer). Bias window ends 0.3 s before Eye A so the screen tap is excluded.
+- Either slide direction is accepted (direction auto-detected).
+- Reset race ("CameraDevice was already closed") fixed: callbacks ignore a stopped provider, RESET is debounced.
+- On failure the app saves `sweepfail_*.json` (per-frame telemetry) plus Eye A and last-frame PNGs to Downloads/StereoProbe.

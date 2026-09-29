@@ -69,7 +69,15 @@ object Mat3 {
 class MotionSensors(context: Context) : SensorEventListener {
 
     private val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-    private val rotSensor: Sensor? = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    // Prefer the game rotation vector (gyro + accelerometer, no magnetometer): far less jitter near metal and electronics.
+    private val rotSensor: Sensor? =
+        sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR) ?: sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    val rotationSourceName: String
+        get() = when (rotSensor?.type) {
+            Sensor.TYPE_GAME_ROTATION_VECTOR -> "GAME_ROTATION_VECTOR"
+            Sensor.TYPE_ROTATION_VECTOR -> "ROTATION_VECTOR"
+            else -> "none"
+        }
     private val linSensor: Sensor? = sm.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
     private val gyroSensor: Sensor? = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
@@ -77,7 +85,7 @@ class MotionSensors(context: Context) : SensorEventListener {
     private val handler = Handler(thread.looper)
 
     val usable: Boolean get() = rotSensor != null && linSensor != null
-    fun describe(): String = "rotationVector=${rotSensor != null} linearAcceleration=${linSensor != null} gyroscope=${gyroSensor != null}"
+    fun describe(): String = "rotation=$rotationSourceName linearAcceleration=${linSensor != null} gyroscope=${gyroSensor != null}"
 
     private class RotSample(val tNs: Long, val r: DoubleArray)
     private class AccSample(val tNs: Long, val a: DoubleArray)
@@ -111,7 +119,7 @@ class MotionSensors(context: Context) : SensorEventListener {
 
     override fun onSensorChanged(event: SensorEvent) {
         when (event.sensor.type) {
-            Sensor.TYPE_ROTATION_VECTOR -> {
+            Sensor.TYPE_ROTATION_VECTOR, Sensor.TYPE_GAME_ROTATION_VECTOR -> {
                 SensorManager.getRotationMatrixFromVector(rmat, event.values)
                 val r = DoubleArray(9) { rmat[it].toDouble() }
                 synchronized(lock) {
@@ -155,7 +163,9 @@ class MotionSensors(context: Context) : SensorEventListener {
     /** Start integrating displacement at [atNs]. Bias = mean device-frame linear acceleration over the preceding 0.5 s. */
     fun beginIntegration(atNs: Long) {
         synchronized(lock) {
-            val recent = accBuf.filter { it.tNs in (atNs - 500_000_000L)..atNs }
+            // Prefer a rest window ending 0.3 s before Eye A so the finger tap on the screen is not in the bias estimate.
+            var recent = accBuf.filter { it.tNs in (atNs - 900_000_000L)..(atNs - 300_000_000L) }
+            if (recent.size < 20) recent = accBuf.filter { it.tNs in (atNs - 500_000_000L)..atNs }
             if (recent.size >= 5) {
                 for (i in 0..2) bias[i] = recent.sumOf { it.a[i] } / recent.size
             } else {
@@ -175,6 +185,22 @@ class MotionSensors(context: Context) : SensorEventListener {
     fun displacementWorld(): DoubleArray = synchronized(lock) { pos.copyOf() }
 
     fun biasSnapshot(): DoubleArray = synchronized(lock) { bias.copyOf() }
+
+    /** Integrated world-frame velocity since [beginIntegration]. */
+    fun velocityWorld(): DoubleArray = synchronized(lock) { vel.copyOf() }
+
+    /** RMS of bias-corrected linear acceleration over the last ~8 samples (m/s^2): small means the phone is being held still. */
+    fun recentAccRms(): Double = synchronized(lock) {
+        val n = minOf(8, accBuf.size)
+        if (n == 0) return@synchronized 0.0
+        var s = 0.0
+        for (i in accBuf.size - n until accBuf.size) {
+            val a = accBuf[i].a
+            val dx = a[0] - bias[0]; val dy = a[1] - bias[1]; val dz = a[2] - bias[2]
+            s += dx * dx + dy * dy + dz * dz
+        }
+        sqrt(s / n)
+    }
 
     /** Device→world rotation nearest to [tNs], or null if nothing within 200 ms. */
     fun rotationAt(tNs: Long): DoubleArray? = synchronized(lock) {

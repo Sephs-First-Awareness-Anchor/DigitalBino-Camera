@@ -111,8 +111,10 @@ class SweepStatus(
     val phase: String,
     val headline: String,
     val detail: String,
-    val baselineCm: Double,
+    val baselineCm: Double,          // motion-sensor estimate: coarse, drifts
     val targetCm: Double,
+    val progress: Double,            // 0..1, from measured parallax (vision), not from the sensor estimate
+    val parallaxTargetPx: Double,
     val pitchDeg: Double,
     val yawDeg: Double,
     val rollDeg: Double,

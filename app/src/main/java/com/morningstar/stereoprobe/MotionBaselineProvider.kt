@@ -22,7 +22,12 @@ import org.json.JSONObject
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.MatOfByte
+import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
@@ -31,23 +36,27 @@ import kotlin.math.min
 
 private const val TAG = "SWEEP"
 
-/** All thresholds in one place so they can be tuned from diagnostics without touching logic. */
+/** All thresholds in one place so they can be tuned from exported diagnostics without touching logic. */
 class SweepConfig {
-    @Volatile var targetBaselineM = 0.06
+    @Volatile var targetBaselineM = 0.06        // guidance and metric-scale reference, NOT the acceptance test
+    var acceptParallaxPx = 10.0                 // translation-induced parallax (tracking-scale px) required to accept Eye B
     var rotationToleranceDeg = 5.0
     var minOverlapPct = 45.0
-    var minPoseInliers = 40
-    var minParallaxPx = 4.0            // at tracking scale
+    var minEInliers = 40
     var minSharpnessRatio = 0.45
     var maxBrightnessDiff = 0.25
-    var minLateralFraction = 0.7
+    var minLateralFraction = 0.4                // loose: integrated IMU displacement drifts, so this is only a sanity check
+    var minSignedLateralFraction = 0.3          // of target baseline, in the sweep direction
     var settleMs = 350L
-    var timeoutMs = 25_000L
+    var timeoutMs = 30_000L
     var trackScale = 0.5
     var analysisW = 1280
     var analysisH = 960
     var candidateBuffer = 8
     var candidateMaxAgeMs = 2000L
+    var sceneBadFrames = 25
+    var stillAccRms = 0.25                      // m/s^2: below this the phone is considered held still
+    var stillGyro = 0.12                        // rad/s
 }
 
 object Yuv {
@@ -81,9 +90,12 @@ object Yuv {
 
 /**
  * MotionBaselineProvider: ONE rear camera stays open and streaming the whole time.
- * Eye A is a frame from the live stream; Eye B is a later frame from the same stream, chosen automatically
- * once the phone has been translated sideways with acceptable rotation, overlap, sharpness and parallax.
- * The camera is never closed or reopened between the two eyes.
+ * Eye A is a frame from the live stream; Eye B is a later frame from the same stream, chosen automatically once
+ * the view has shifted by genuine translation parallax (not explained by rotation) with acceptable rotation,
+ * overlap, sharpness and exposure. The camera is never closed or reopened between the two eyes.
+ *
+ * What proves "enough baseline" is measured PARALLAX (vision). Integrated accelerometer displacement drifts by
+ * centimetres within seconds, so it is used only for direction sanity and for a coarse metric-scale estimate.
  *
  * Threading: camera callbacks copy frames and hand them to one processing thread. All sweep state lives on that thread.
  */
@@ -101,9 +113,10 @@ class MotionBaselineProvider(
     private class EyeA(val up: Mat, val feats: FrameFeatures, val tsNs: Long, val rot: DoubleArray)
 
     private class Candidate(
-        val up: Mat, val tsNs: Long, val score: Double, val lateral: Double,
-        val rotB: DoubleArray, val dDev: DoubleArray, val metrics: VisualMetrics,
-        val pitch: Double, val yaw: Double, val roll: Double, val sharp: Double, val wallMs: Long
+        val up: Mat, val tsNs: Long, val score: Double, val parallax: Double,
+        val rotB: DoubleArray, val pWorld: DoubleArray, val vWorld: DoubleArray, val still: Boolean,
+        val metrics: VisualMetrics, val pitch: Double, val yaw: Double, val roll: Double,
+        val sharp: Double, val wallMs: Long
     )
 
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -147,27 +160,33 @@ class MotionBaselineProvider(
     private val rejectReasons = HashMap<String, Int>()
     private var sceneBadStreak = 0
     private var frameCounter = 0
+    private var sweepSign = 0                       // +1 right, -1 left, 0 not yet determined
+    private val frameLog = ArrayList<JSONObject>()
+    private var lastUp: Mat? = null
 
     // ───────────────────────── lifecycle ─────────────────────────
 
+    private fun failUi(msg: String) {
+        if (!stopped) listener.onFailure(msg)
+    }
+
     override fun start() {
         if (!sensors.usable) {
-            listener.onFailure("Motion sensors (rotation vector + linear acceleration) are unavailable on this device.")
+            failUi("Motion sensors (rotation + linear acceleration) are unavailable on this device.")
             return
         }
         val rear = probe.cameras.filter { it.listed && it.facing == CameraCharacteristics.LENS_FACING_BACK }
         if (rear.isEmpty()) {
-            listener.onFailure("No listed rear camera found.")
+            failUi("No listed rear camera found.")
             return
         }
-        // Prefer the rear camera with the largest pixel array (the main camera on this handset).
         camInfo = rear.maxByOrNull { pixelArea(it) } ?: rear.first()
         camId = camInfo.id
         sensorOrientation = camInfo.json.optInt("sensorOrientationDeg", 90)
         realtimeTimestamps = camInfo.timestampSource == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
 
         val size = chooseSize() ?: run {
-            listener.onFailure("Camera $camId exposes no YUV_420_888 output size.")
+            failUi("Camera $camId exposes no YUV_420_888 output size.")
             return
         }
         val kLand = Intrinsics.derive(camInfo, size.width, size.height)
@@ -179,7 +198,9 @@ class MotionBaselineProvider(
             270 -> Core.ROTATE_90_COUNTERCLOCKWISE
             else -> -1
         }
-        Diagnostics.log(TAG, "camera $camId size ${size.width}x${size.height} sensorOrientation=$sensorOrientation realtimeTs=$realtimeTimestamps K=${kUp.source}")
+        Diagnostics.log(TAG, "camera $camId ${size.width}x${size.height} sensorOrientation=$sensorOrientation realtimeTs=$realtimeTimestamps")
+        Diagnostics.log(TAG, "K(upright)=fx ${"%.1f".format(kUp.fx)} fy ${"%.1f".format(kUp.fy)} cx ${"%.1f".format(kUp.cx)} cy ${"%.1f".format(kUp.cy)}; ${kUp.source}")
+        Diagnostics.log(TAG, "reported lensIntrinsicCalibration=${camInfo.json.optString("lensIntrinsicCalibration_fx_fy_cx_cy_s")} derivedHFovDeg=${camInfo.json.optJSONArray("derivedHorizontalFovDeg")}")
         Diagnostics.log(TAG, "sensors: ${sensors.describe()}")
         sensors.start()
         openCamera(size)
@@ -199,8 +220,9 @@ class MotionBaselineProvider(
         }
         procHandler.post {
             clearCandidates(null)
-            // eyeA is intentionally not released here if it was handed to a result.
+            // eyeA is not released if it was handed to a result.
             if (phase != Phase.DONE) { eyeA?.up?.release(); eyeA?.feats?.release() }
+            lastUp?.release(); lastUp = null
             procThread.quitSafely()
         }
     }
@@ -265,7 +287,7 @@ class MotionBaselineProvider(
                         }
                     }
                 } catch (t: Throwable) {
-                    Diagnostics.error(TAG, "image handling failed", t)
+                    if (!stopped) Diagnostics.error(TAG, "image handling failed", t)
                 } finally {
                     try { img?.close() } catch (_: Throwable) {}
                 }
@@ -273,22 +295,23 @@ class MotionBaselineProvider(
 
             manager.openCamera(camId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    if (stopped) { try { camera.close() } catch (_: Throwable) {}; return }
                     device = camera
                     createSession(camera, rd)
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
                     try { camera.close() } catch (_: Throwable) {}
-                    if (!stopped) listener.onFailure("Camera disconnected (another app may have taken it).")
+                    failUi("Camera disconnected (another app may have taken it).")
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
                     try { camera.close() } catch (_: Throwable) {}
-                    if (!stopped) listener.onFailure("Camera error: ${Diagnostics.deviceErrorName(error)}")
+                    failUi("Camera error: ${Diagnostics.deviceErrorName(error)}")
                 }
             }, camHandler)
         } catch (t: Throwable) {
-            listener.onFailure("Could not open camera: ${Diagnostics.describe(t)}")
+            failUi("Could not open camera: ${Diagnostics.describe(t)}")
         }
     }
 
@@ -300,6 +323,7 @@ class MotionBaselineProvider(
                 camExecutor,
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
+                        if (stopped) { try { s.close() } catch (_: Throwable) {}; return }
                         session = s
                         try {
                             val b = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
@@ -309,18 +333,18 @@ class MotionBaselineProvider(
                             s.setRepeatingRequest(b.build(), null, camHandler)
                             Diagnostics.log(TAG, "camera streaming (single continuous session)")
                         } catch (t: Throwable) {
-                            listener.onFailure("Could not start streaming: ${Diagnostics.describe(t)}")
+                            failUi("Could not start streaming: ${Diagnostics.describe(t)}")
                         }
                     }
 
                     override fun onConfigureFailed(s: CameraCaptureSession) {
-                        listener.onFailure("Camera session configuration failed.")
+                        failUi("Camera session configuration failed.")
                     }
                 }
             )
             camera.createCaptureSession(cfg)
         } catch (t: Throwable) {
-            listener.onFailure("Could not create camera session: ${Diagnostics.describe(t)}")
+            failUi("Could not create camera session: ${Diagnostics.describe(t)}")
         }
     }
 
@@ -343,7 +367,7 @@ class MotionBaselineProvider(
                 s.setRepeatingRequest(b.build(), null, camHandler)
                 Diagnostics.log(TAG, "AE/AWB/AF ${if (locked) "LOCKED" else "released"} (aeLockAvailable=$aeLockAvailable)")
             } catch (t: Throwable) {
-                Diagnostics.error(TAG, "lock update failed", t)
+                if (!stopped) Diagnostics.error(TAG, "lock update failed", t)
             }
         }
     }
@@ -368,6 +392,11 @@ class MotionBaselineProvider(
             listener.onLiveFrame(Bmp.fromBgr(small))
             frameCounter++
 
+            if (phase == Phase.SWEEPING || phase == Phase.SETTLING) {
+                lastUp?.release()
+                lastUp = up.clone()
+            }
+
             when (phase) {
                 Phase.LIVE -> liveStep()
                 Phase.WAIT_EYE_A -> waitEyeAStep(up, small, gray, tsNs)
@@ -380,22 +409,25 @@ class MotionBaselineProvider(
     }
 
     private fun status(
-        headline: String, detail: String = "", baseline: Double = 0.0,
+        headline: String, detail: String = "", baseline: Double = 0.0, progress: Double = 0.0,
         pitch: Double = 0.0, yaw: Double = 0.0, roll: Double = 0.0,
-        m: VisualMetrics = VisualMetrics.EMPTY, orientationOk: Boolean = true
+        m: VisualMetrics = VisualMetrics.EMPTY, parallax: Double = 0.0, orientationOk: Boolean = true
     ) {
         listener.onStatus(
             SweepStatus(
                 phase.name, headline, detail, baseline * 100.0, config.targetBaselineM * 100.0,
-                pitch, yaw, roll, m.overlapPct, m.matches, m.poseInliers, m.parallaxImuRotPx, orientationOk
+                progress.coerceIn(0.0, 1.0), config.acceptParallaxPx,
+                pitch, yaw, roll, m.overlapPct, m.matches, m.eInliers, parallax, orientationOk
             )
         )
     }
 
     private fun liveStep() {
         val moving = sensors.gyroSpeed() > 0.3
-        status(if (moving) "Hold steady, then press CAPTURE" else "Frame your subject, then press CAPTURE",
-            "Camera is running; motion sensors ${if (sensors.usable) "OK" else "missing"}")
+        status(
+            if (moving) "Hold steady, then press CAPTURE" else "Frame your subject, then press CAPTURE",
+            "Aim at something with texture and some depth, about 1 to 3 metres away"
+        )
     }
 
     private fun waitEyeAStep(up: Mat, small: Mat, gray: Mat, tsNs: Long) {
@@ -414,13 +446,13 @@ class MotionBaselineProvider(
         if (rot == null) {
             feats.release()
             phase = Phase.FAILED
-            listener.onFailure("Motion sensors are not reporting orientation.")
+            failUi("Motion sensors are not reporting orientation.")
             return
         }
         eyeA = EyeA(up.clone(), feats, tsNs, rot)
         sensors.beginIntegration(tsNs)
         setLocks(true)
-        rejected = 0; rejectReasons.clear(); sceneBadStreak = 0
+        rejected = 0; rejectReasons.clear(); sceneBadStreak = 0; sweepSign = 0; frameLog.clear()
         sweepStartMs = SystemClock.elapsedRealtime()
         phase = Phase.SWEEPING
         Diagnostics.log(TAG, "Eye A locked: features=${feats.points.size} sharp=${"%.1f".format(feats.sharpness)} bias=${sensors.biasSnapshot().joinToString { "%.4f".format(it) }}")
@@ -439,119 +471,142 @@ class MotionBaselineProvider(
         val rotB = sensors.rotationAt(tsNs)
         if (rotB == null) { status("Motion sensors not reporting"); return }
 
-        // Device rotation from A to B, expressed in A's axes (right-handed about device X, Y, Z).
+        // Device rotation from A to B expressed in A's axes (right-handed about device X, Y, Z).
         val delta = Mat3.mul(Mat3.transpose(a.rot), rotB)
         val w = Mat3.smallAngleVec(delta)
         val pitch = Math.toDegrees(w[0])
         val yaw = Math.toDegrees(w[1])
         val roll = Math.toDegrees(w[2])
         val relCam = Mat3.devToCam(Mat3.mul(Mat3.transpose(rotB), a.rot))
-
-        // IMU displacement expressed in device-A axes (X right, Y up, Z toward the user).
-        val dDev = Mat3.mulVec(Mat3.transpose(a.rot), sensors.displacementWorld())
-        val total = Mat3.norm(dDev)
-        val lateral = dDev[0]
-        val target = cfg.targetBaselineM
-        val tol = cfg.rotationToleranceDeg
         val rotWorst = max(abs(pitch), max(abs(yaw), abs(roll)))
+        val tol = cfg.rotationToleranceDeg
         val rotOk = rotWorst <= tol
 
-        if (total < 0.01) {
-            status("Slide phone right", "Keep the phone's orientation, move it sideways", lateral, pitch, yaw, roll, VisualMetrics.EMPTY, rotOk)
-            return
-        }
+        // Coarse IMU displacement in device-A axes (X right, Y up, Z toward the user). Drifts; used for direction sanity only.
+        val pW = sensors.displacementWorld()
+        val vW = sensors.velocityWorld()
+        val dDev = Mat3.mulVec(Mat3.transpose(a.rot), pW)
+        val total = Mat3.norm(dDev)
+        val lateralRaw = dDev[0]
+        if (sweepSign == 0 && abs(lateralRaw) >= 0.012) sweepSign = if (lateralRaw > 0) 1 else -1
+        val dirSign = if (sweepSign == 0) 1 else sweepSign
+        val lateral = lateralRaw * dirSign
+        val dirWord = if (dirSign > 0) "right" else "left"
+        val target = cfg.targetBaselineM
 
         val fb = tracker.describe(gray)
         val m = tracker.compare(a.feats, fb, kTrack, relCam)
 
+        val parallax = m.parallaxImuRotPx
+        val progress = parallax / cfg.acceptParallaxPx
         val overlapOk = m.overlapPct >= cfg.minOverlapPct
-        val poseOk = m.poseInliers >= cfg.minPoseInliers
-        val parallaxOk = m.parallaxImuRotPx >= cfg.minParallaxPx
+        val geomOk = m.eInliers >= cfg.minEInliers && m.rotation != null
+        val parallaxOk = parallax >= cfg.acceptParallaxPx
         val sharpOk = fb.sharpness >= cfg.minSharpnessRatio * a.feats.sharpness
         val brightOk = abs(fb.brightness - a.feats.brightness) / max(1.0, a.feats.brightness) <= cfg.maxBrightnessDiff
         val latFrac = if (total > 1e-6) lateral / total else 0.0
-        val latDirOk = latFrac >= cfg.minLateralFraction
-        val inlierRatio = if (m.matches > 0) m.poseInliers.toDouble() / m.matches else 0.0
-        val sceneOk = m.matches < 80 || inlierRatio >= 0.3
-        if (m.matches >= 80 && inlierRatio < 0.25) sceneBadStreak++ else sceneBadStreak = 0
+        val latDirOk = latFrac >= cfg.minLateralFraction && lateral >= cfg.minSignedLateralFraction * target
+        val consistentOk = m.matches < 60 || m.consistentPct >= 25.0
+        val eRatio = if (m.matches > 0) m.eInliers.toDouble() / m.matches else 0.0
+        // "Scene changed" only when matches are wrong everywhere (rotation-inconsistent AND no epipolar structure).
+        if (m.matches >= 80 && m.consistentPct < 15.0 && eRatio < 0.15) sceneBadStreak++ else sceneBadStreak = 0
 
         val reasons = ArrayList<String>()
         if (!rotOk) reasons.add("rotation")
         if (!overlapOk) reasons.add("overlap")
-        if (!poseOk) reasons.add("pose")
-        if (!parallaxOk) reasons.add("parallax")
+        if (!geomOk) reasons.add("geometry")
         if (!sharpOk) reasons.add("blur")
         if (!brightOk) reasons.add("exposure")
         if (!latDirOk) reasons.add("not-lateral")
-        if (!sceneOk) reasons.add("scene-changed")
+        if (!consistentOk) reasons.add("scene-changed")
+        val gatesExceptParallax = reasons.isEmpty()
+        if (!parallaxOk) reasons.add("parallax")
         val eligible = reasons.isEmpty()
         if (!eligible) {
             rejected++
             for (r in reasons) rejectReasons[r] = (rejectReasons[r] ?: 0) + 1
         }
 
-        // Candidate score (documented in the exported diagnostics).
-        val latScore = 1.0 - min(1.0, abs(lateral - target) / target)
-        val score = 0.35 * latScore +
-            0.20 * min(1.0, m.poseInliers / 200.0) +
+        val stillNow = sensors.gyroSpeed() < cfg.stillGyro && sensors.recentAccRms() < cfg.stillAccRms
+        // Prefer frames a little past the required parallax, sharp, well-oriented, with lots of geometry.
+        val parScore = 1.0 - min(1.0, abs(progress - 1.25) / 1.25)
+        val score = 0.35 * parScore +
+            0.20 * min(1.0, m.eInliers / 250.0) +
             0.15 * min(1.0, fb.sharpness / max(1e-6, a.feats.sharpness)) +
             0.15 * max(0.0, 1.0 - rotWorst / tol) +
-            0.15 * min(1.0, m.overlapPct / 100.0)
+            0.10 * min(1.0, m.overlapPct / 100.0) +
+            0.05 * (if (stillNow) 1.0 else 0.0)
 
-        if (eligible && lateral >= 0.5 * target) {
-            candidates.add(Candidate(up.clone(), tsNs, score, lateral, rotB, dDev, m, pitch, yaw, roll, fb.sharpness, nowMs))
+        if (gatesExceptParallax && progress >= 0.5) {
+            candidates.add(Candidate(up.clone(), tsNs, score, parallax, rotB, pW, vW, stillNow, m, pitch, yaw, roll, fb.sharpness, nowMs))
             pruneCandidates(nowMs)
         }
         fb.release()
 
-        if (frameCounter % 4 == 0) {
+        val row = JSONObject()
+            .put("tMs", (tsNs - a.tsNs) / 1e6)
+            .put("imuLateralCm", lateralRaw * 100).put("imuTotalCm", total * 100)
+            .put("pitch", pitch).put("yaw", yaw).put("roll", roll)
+            .put("matches", m.matches).put("eInliers", m.eInliers).put("poseInliers", m.poseInliers)
+            .put("overlapPct", m.overlapPct).put("consistentPct", m.consistentPct)
+            .put("parallaxImuPx", m.parallaxImuRotPx).put("parallaxVisPx", m.parallaxVisRotPx)
+            .put("flowMedianPx", m.flowMedianPx).put("imuVisRotDisagreeDeg", m.imuVisRotDisagreementDeg)
+            .put("sharpRatio", fb.sharpness / max(1e-6, a.feats.sharpness))
+            .put("score", score).put("still", stillNow).put("eligible", eligible)
+            .put("reasons", reasons.joinToString(","))
+        if (frameLog.size < 600) frameLog.add(row)
+
+        if (frameCounter % 3 == 0) {
             Diagnostics.log(
                 TAG,
-                "lat=${"%.1f".format(lateral * 100)}cm tot=${"%.1f".format(total * 100)}cm rot=(${"%.1f".format(pitch)},${"%.1f".format(yaw)},${"%.1f".format(roll)})° " +
-                    "match=${m.matches} pose=${m.poseInliers} overlap=${"%.0f".format(m.overlapPct)}% par=${"%.1f".format(m.parallaxImuRotPx)}px " +
-                    "score=${"%.2f".format(score)} ${if (eligible) "OK" else reasons.joinToString(",")}"
+                "par=${"%.1f".format(parallax)}/${"%.0f".format(cfg.acceptParallaxPx)}px imu=${"%.1f".format(lateralRaw * 100)}/${"%.1f".format(total * 100)}cm " +
+                    "rot=(${"%.1f".format(pitch)},${"%.1f".format(yaw)},${"%.1f".format(roll)})° match=${m.matches} E=${m.eInliers} pose=${m.poseInliers} " +
+                    "ovl=${"%.0f".format(m.overlapPct)}% cons=${"%.0f".format(m.consistentPct)}% flow=${"%.1f".format(m.flowMedianPx)}px " +
+                    "${if (eligible) "OK" else reasons.joinToString(",")}"
             )
         }
 
-        if (sceneBadStreak >= 12) {
+        if (sceneBadStreak >= cfg.sceneBadFrames) {
             fail("Scene changed too much. Try again.")
             return
         }
 
-        if (phase == Phase.SWEEPING && eligible && lateral >= 0.9 * target) {
+        if (phase == Phase.SWEEPING && eligible) {
             phase = Phase.SETTLING
             settleStartNs = tsNs
         }
         if (phase == Phase.SETTLING) {
             if (tsNs - settleStartNs >= cfg.settleMs * 1_000_000L) {
-                val best = candidates.filter { it.lateral >= 0.9 * target }.maxByOrNull { it.score }
+                val best = candidates.filter { it.parallax >= cfg.acceptParallaxPx }.maxByOrNull { it.score }
                 if (best != null) {
                     finalizeCapture(a, best)
                     return
                 }
                 phase = Phase.SWEEPING
             } else {
-                status("Baseline acquired", "Hold still: choosing the best frame", lateral, pitch, yaw, roll, m, rotOk)
+                status("Baseline acquired", "Hold still: choosing the best frame", lateral, progress, pitch, yaw, roll, m, parallax, rotOk)
                 return
             }
         }
 
-        // Guidance: first unmet condition wins.
         val (headline, detail) = when {
             !rotOk -> rotationHint(pitch, yaw, roll, tol)
-            lateral > 1.8 * target -> Pair("Too far: slide back a little", "")
-            lateral < 0.9 * target -> Pair("Keep sliding right", "Progress ${"%.1f".format(lateral * 100)} of ${"%.1f".format(target * 100)} cm")
-            !latDirOk -> Pair("Move sideways, not forward or up", "Sideways share of motion ${"%.0f".format(latFrac * 100)}%")
+            !parallaxOk && total < 0.008 && progress < 0.15 -> Pair("Slide phone $dirWord", "Keep the phone's orientation, move it sideways")
+            !parallaxOk -> Pair(
+                "Keep sliding $dirWord",
+                "Parallax ${"%.1f".format(parallax)} of ${"%.0f".format(cfg.acceptParallaxPx)} px  ·  about ${"%.1f".format(lateral * 100)} cm by motion sensors (coarse)"
+            )
+            !latDirOk -> Pair("Move sideways, not forward or up", "Sensors say the motion is mostly not sideways")
             !overlapOk -> Pair("Bring the scene back into view", "")
             !sharpOk -> Pair("Slow down", "Motion blur")
-            !parallaxOk -> Pair("No parallax detected", "Scene may be too distant, or you are pivoting instead of sliding")
-            !poseOk -> Pair("Not enough matching detail", "Point at something with more texture")
+            !geomOk -> Pair("Not enough matching detail", "Point at something with more texture and depth")
+            !consistentOk -> Pair("Scene is changing", "Keep the subject still")
             else -> Pair("Baseline acquired", "")
         }
-        status(headline, detail, lateral, pitch, yaw, roll, m, rotOk)
+        status(headline, detail, lateral, progress, pitch, yaw, roll, m, parallax, rotOk)
     }
 
-    /** Derived from right-hand rotation of the device about its own axes; direction wording is still to be confirmed on hardware. */
+    /** Derived from right-hand rotation of the device about its own axes; direction wording still to be confirmed on hardware. */
     private fun rotationHint(pitch: Double, yaw: Double, roll: Double, tol: Double): Pair<String, String> {
         val worst = max(abs(pitch), max(abs(yaw), abs(roll)))
         val text = when (worst) {
@@ -582,8 +637,51 @@ class MotionBaselineProvider(
         phase = Phase.FAILED
         sensors.endIntegration()
         Diagnostics.log(TAG, "FAILED: $message rejected=$rejected reasons=$rejectReasons")
-        listener.onFailure(message)
+        dumpFailure(message)
+        failUi(message)
     }
+
+    /** Failure is data: save the per-frame telemetry and the two frames involved so the run can be analysed offline. */
+    private fun dumpFailure(reason: String) {
+        try {
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val base = "sweepfail_$stamp"
+            val j = JSONObject()
+                .put("reportFormat", "binosweep-failure/1")
+                .put("reason", reason)
+                .put("rejectedFrames", rejected)
+                .put("rejectReasons", JSONObject(rejectReasons as Map<*, *>))
+                .put("intrinsics", kUp.toJson())
+                .put("rotationSource", sensors.rotationSourceName)
+                .put("imuBias", JSONArray(sensors.biasSnapshot().toList()))
+                .put("sweepSign", sweepSign)
+                .put("config", configJson())
+                .put("frames", JSONArray(frameLog))
+            ReportExporter.save(context, "${base}.json", "application/json", j.toString(2).toByteArray())
+            savePng("${base}_eyeA.png", eyeA?.up)
+            savePng("${base}_lastFrame.png", lastUp)
+        } catch (t: Throwable) {
+            Diagnostics.error(TAG, "failure dump failed", t)
+        }
+    }
+
+    private fun savePng(name: String, m: Mat?) {
+        if (m == null || m.empty()) return
+        val buf = MatOfByte()
+        Imgcodecs.imencode(".png", m, buf)
+        ReportExporter.save(context, name, "image/png", buf.toArray())
+        buf.release()
+    }
+
+    private fun configJson(): JSONObject = JSONObject()
+        .put("targetBaselineM", config.targetBaselineM)
+        .put("acceptParallaxPx", config.acceptParallaxPx)
+        .put("rotationToleranceDeg", config.rotationToleranceDeg)
+        .put("minOverlapPct", config.minOverlapPct)
+        .put("minEInliers", config.minEInliers)
+        .put("minSharpnessRatio", config.minSharpnessRatio)
+        .put("minLateralFraction", config.minLateralFraction)
+        .put("sceneBadFrames", config.sceneBadFrames)
 
     // ───────────────────────── finalize: refine pose, fuse baseline, emit result ─────────────────────────
 
@@ -606,7 +704,7 @@ class MotionBaselineProvider(
             val fb = refine.describe(gB)
             val full = refine.compare(fa, fb, kUp, relCam)
             fa.release(); fb.release()
-            if (full.rotation != null && full.tUnit != null && full.poseInliers >= 60) {
+            if (full.rotation != null && full.tUnit != null && full.eInliers >= 60) {
                 vm = full
                 poseSource = "full-resolution (${kUp.width}x${kUp.height})"
             }
@@ -618,7 +716,7 @@ class MotionBaselineProvider(
 
         val rot = vm.rotation
         val tu = vm.tUnit
-        if (rot == null || tu == null || vm.poseInliers < config.minPoseInliers) {
+        if (rot == null || tu == null || vm.eInliers < config.minEInliers) {
             clearCandidates(null)
             a.up.release(); a.feats.release()
             fail("Geometry could not be recovered confidently. Try again with more texture and depth in view.")
@@ -626,41 +724,56 @@ class MotionBaselineProvider(
         }
 
         // Visual baseline direction in camera-A coordinates: c = -R^T t.
-        val rT = Mat3.transpose(rot)
-        val rt = Mat3.mulVec(rT, tu)
+        val rt = Mat3.mulVec(Mat3.transpose(rot), tu)
         val cVis = doubleArrayOf(-rt[0], -rt[1], -rt[2])
-        // IMU displacement in upright camera-A coordinates (x right, y down, z forward).
-        val dCam = doubleArrayOf(best.dDev[0], -best.dDev[1], -best.dDev[2])
+
+        // Drift correction: if the phone was held still at Eye B, true velocity is ~0, so the residual velocity is
+        // accumulated bias. Constant bias b gives v_err = bT and p_err = bT^2/2 = v_end*T/2.
+        val tSec = (best.tsNs - a.tsNs) / 1e9
+        val pCorrW = if (best.still) doubleArrayOf(
+            best.pWorld[0] - best.vWorld[0] * tSec / 2.0,
+            best.pWorld[1] - best.vWorld[1] * tSec / 2.0,
+            best.pWorld[2] - best.vWorld[2] * tSec / 2.0
+        ) else best.pWorld
+        val rAT = Mat3.transpose(a.rot)
+        val dDevRaw = Mat3.mulVec(rAT, best.pWorld)
+        val dDevUsed = Mat3.mulVec(rAT, pCorrW)
+        val dCam = doubleArrayOf(dDevUsed[0], -dDevUsed[1], -dDevUsed[2])   // upright camera-A axes
         val dNorm = Mat3.norm(dCam)
         val cos = if (dNorm > 1e-9) Mat3.dot(dCam, cVis) / (dNorm * Mat3.norm(cVis)) else 0.0
         val baseline: Double
         val baselineSource: String
         if (cos > 0.5) {
             baseline = Mat3.dot(dCam, cVis) / Mat3.norm(cVis)
-            baselineSource = "IMU displacement projected onto the visual translation direction (cos=${"%.2f".format(cos)})"
+            baselineSource = "motion-sensor displacement${if (best.still) " (drift-corrected, held still)" else " (NOT drift-corrected: phone was moving)"} " +
+                "projected onto the visual translation direction (cos=${"%.2f".format(cos)})"
         } else {
             baseline = dNorm
-            baselineSource = "IMU displacement magnitude; direction DISAGREES with vision (cos=${"%.2f".format(cos)}), scale unreliable"
+            baselineSource = "motion-sensor displacement magnitude; its direction DISAGREES with vision (cos=${"%.2f".format(cos)}), scale unreliable"
         }
-        val baselineConf = (cos.coerceIn(0.0, 1.0)) * min(1.0, vm.poseInliers / 150.0)
+        val stillFactor = if (best.still) 1.0 else 0.6
+        val baselineConf = cos.coerceIn(0.0, 1.0) * min(1.0, vm.eInliers / 150.0) * stillFactor
         val captureConf = (0.5 * best.score + 0.5 * baselineConf).coerceIn(0.0, 1.0)
 
         val q = JSONObject()
             .put("cameraId", camId)
             .put("sensorOrientationDeg", sensorOrientation)
+            .put("rotationSource", sensors.rotationSourceName)
             .put("intrinsics", kUp.toJson())
             .put("poseSource", poseSource)
             .put("requestedBaselineM", config.targetBaselineM)
             .put("estimatedBaselineM", baseline)
             .put("baselineSource", baselineSource)
-            .put("imuDisplacementDeviceAxesM_xRight_yUp_zTowardUser", JSONArray(best.dDev.toList()))
+            .put("heldStillAtEyeB", best.still)
+            .put("imuDisplacementRawDeviceAxesM_xRight_yUp_zTowardUser", JSONArray(dDevRaw.toList()))
+            .put("imuDisplacementUsedDeviceAxesM", JSONArray(dDevUsed.toList()))
             .put("imuBiasDeviceAxes", JSONArray(sensors.biasSnapshot().toList()))
             .put("visualTranslationDirCamA", JSONArray(cVis.toList()))
             .put("imuVsVisualDirectionCos", cos)
             .put("rotationDeviceDeg_pitchYawRoll", JSONArray(listOf(best.pitch, best.yaw, best.roll)))
             .put("imuVsVisualRotationDisagreementDeg", vm.imuVisRotDisagreementDeg)
-            .put("matches", vm.matches).put("essentialInliers", vm.inliers).put("poseInliers", vm.poseInliers)
-            .put("overlapPct", vm.overlapPct)
+            .put("matches", vm.matches).put("essentialInliers", vm.eInliers).put("poseInliers", vm.poseInliers)
+            .put("overlapPct", vm.overlapPct).put("consistentPct", vm.consistentPct)
             .put("parallaxImuRotationOnlyPx_trackingScale", best.metrics.parallaxImuRotPx)
             .put("parallaxVisualRotationOnlyPx_finalRes", vm.parallaxVisRotPx)
             .put("poseConfidence", baselineConf)
@@ -671,13 +784,8 @@ class MotionBaselineProvider(
             .put("selectedCandidateScore", best.score)
             .put("sharpnessEyeA", a.feats.sharpness).put("sharpnessEyeB", best.sharp)
             .put("aeAwbAfLocked", aeLockAvailable)
-            .put("config", JSONObject()
-                .put("rotationToleranceDeg", config.rotationToleranceDeg)
-                .put("minOverlapPct", config.minOverlapPct)
-                .put("minPoseInliers", config.minPoseInliers)
-                .put("minParallaxPx", config.minParallaxPx)
-                .put("minSharpnessRatio", config.minSharpnessRatio)
-                .put("minLateralFraction", config.minLateralFraction))
+            .put("config", configJson())
+            .put("frames", JSONArray(frameLog))
 
         clearCandidates(best)
         a.feats.release()
@@ -686,7 +794,7 @@ class MotionBaselineProvider(
             rot, tu, baseline, baselineSource, baselineConf, captureConf, q
         )
         phase = Phase.DONE
-        Diagnostics.log(TAG, "RESULT baseline=${"%.1f".format(baseline * 100)}cm conf=${"%.2f".format(captureConf)} poseInliers=${vm.poseInliers} dt=${"%.0f".format((best.tsNs - a.tsNs) / 1e6)}ms")
-        listener.onResult(result)
+        Diagnostics.log(TAG, "RESULT baseline=${"%.1f".format(baseline * 100)}cm conf=${"%.2f".format(captureConf)} E=${vm.eInliers} dt=${"%.0f".format(tSec * 1000)}ms still=${best.still}")
+        if (!stopped) listener.onResult(result)
     }
 }

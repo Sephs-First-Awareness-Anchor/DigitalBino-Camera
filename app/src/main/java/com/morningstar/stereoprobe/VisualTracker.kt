@@ -16,6 +16,7 @@ import org.opencv.features2d.DescriptorMatcher
 import org.opencv.features2d.ORB
 import org.opencv.imgproc.Imgproc
 import kotlin.math.hypot
+import kotlin.math.max
 
 class FrameFeatures(
     val points: Array<Point>,
@@ -30,23 +31,30 @@ class FrameFeatures(
 
 /**
  * Evidence extracted by comparing two views.
- * - parallax*Px: median residual after explaining the motion by ROTATION ONLY. Pure pivoting leaves ≈ 0;
- *   genuine viewpoint translation leaves depth-dependent parallax.
- * - rotation / tUnit: relative pose from the essential matrix (translation is up to scale).
+ *
+ * - eInliers: essential-matrix RANSAC inliers, counted BEFORE any depth filtering. This is the geometry-quality number.
+ * - poseInliers: recoverPose survivors with far-point rejection disabled (cheirality only).
+ * - overlapPct: how much of frame A is still matched in frame B (larger of the essential-inlier hull and the
+ *   rotation-consistent-match hull), so it does not collapse when the essential matrix is poorly conditioned.
+ * - consistentPct: share of ALL matches whose position agrees (loosely) with rotation-only prediction from the IMU.
+ *   Low values mean matches are wrong or the scene changed, not merely that parallax is small.
+ * - parallax*Px: median residual after explaining motion by ROTATION ONLY. Pure pivoting leaves about 0.
  */
 class VisualMetrics(
     val matches: Int,
-    val inliers: Int,
+    val eInliers: Int,
     val poseInliers: Int,
     val overlapPct: Double,
+    val consistentPct: Double,
     val parallaxVisRotPx: Double,
     val parallaxImuRotPx: Double,
+    val flowMedianPx: Double,
     val rotation: DoubleArray?,
     val tUnit: DoubleArray?,
     val imuVisRotDisagreementDeg: Double
 ) {
     companion object {
-        val EMPTY = VisualMetrics(0, 0, 0, 0.0, 0.0, 0.0, null, null, 0.0)
+        val EMPTY = VisualMetrics(0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, null, null, 0.0)
     }
 }
 
@@ -74,7 +82,7 @@ class VisualTracker(nFeatures: Int = 1500) {
         return FrameFeatures(pts, desc, gray.cols(), gray.rows(), s * s, bright)
     }
 
-    /** [k] must be the intrinsics of the images the features were computed on. [imuRotCam] maps camera-A to camera-B coordinates. */
+    /** [k] must be the intrinsics of the images the features came from. [imuRotCam] maps camera-A to camera-B coordinates. */
     fun compare(a: FrameFeatures, b: FrameFeatures, k: Intrinsics, imuRotCam: DoubleArray?): VisualMetrics {
         if (a.descriptors.empty() || b.descriptors.empty()) return VisualMetrics.EMPTY
 
@@ -92,27 +100,42 @@ class VisualTracker(nFeatures: Int = 1500) {
             m.release()
         }
         val n = pa.size
-        if (n < 15) return VisualMetrics(n, 0, 0, 0.0, 0.0, 0.0, null, null, 0.0)
+        if (n < 15) return VisualMetrics(n, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, null, null, 0.0)
+
+        // Rotation-only prediction (IMU if available, otherwise identity) for every match.
+        val rPred = imuRotCam ?: doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+        val resid = DoubleArray(n) { residual(pa[it], pb[it], rPred, k) }
+        val consistThresh = 0.06 * a.width
+        val keepC = BooleanArray(n) { resid[it] < consistThresh }
+        val consistentPct = 100.0 * keepC.count { it } / n
+        val flowMedian = FrameSynchronizer.median(resid.toList())
+        val overlapC = coveragePct(pa, keepC, a.width, a.height)
 
         val p1 = MatOfPoint2f(); p1.fromList(pa)
         val p2 = MatOfPoint2f(); p2.fromList(pb)
         val kMat = k.kMat()
         val mask = Mat()
-        val eAll = Calib3d.findEssentialMat(p1, p2, kMat, Calib3d.RANSAC, 0.999, 1.5, 1000, mask)
+        val eAll = Calib3d.findEssentialMat(p1, p2, kMat, Calib3d.RANSAC, 0.999, 2.0, 1000, mask)
         if (eAll.empty() || eAll.rows() < 3) {
             p1.release(); p2.release(); kMat.release(); mask.release(); eAll.release()
-            return VisualMetrics(n, 0, 0, 0.0, 0.0, 0.0, null, null, 0.0)
+            val par = if (imuRotCam != null) FrameSynchronizer.median(resid.toList()) else 0.0
+            return VisualMetrics(n, 0, 0, overlapC, consistentPct, 0.0, par, flowMedian, null, null, 0.0)
         }
         val e = eAll.rowRange(0, 3).clone()
-        val inliers = Core.countNonZero(mask)
 
+        // Essential-matrix inliers BEFORE recoverPose rewrites the mask.
+        val eBytes = ByteArray(n)
+        mask.get(0, 0, eBytes)
+        val keepE = BooleanArray(n) { eBytes[it].toInt() != 0 }
+        val eInliers = keepE.count { it }
+
+        // recoverPose with far-point rejection disabled: the default discards points beyond ~50 baselines,
+        // which for a 5 cm slide is everything farther than about 2.5 m.
+        val poseMask = mask.clone()
+        val tri = Mat()
         val rMat = Mat()
         val tMat = Mat()
-        val poseInliers = Calib3d.recoverPose(e, p1, p2, kMat, rMat, tMat, mask)
-
-        val mk = ByteArray(n)
-        mask.get(0, 0, mk)
-        val keep = BooleanArray(n) { mk[it].toInt() != 0 }
+        val poseInliers = Calib3d.recoverPose(e, p1, p2, kMat, rMat, tMat, 1.0e6, poseMask, tri)
 
         val rArr = DoubleArray(9)
         val tArr = DoubleArray(3)
@@ -122,16 +145,20 @@ class VisualTracker(nFeatures: Int = 1500) {
             tMat.get(0, 0, tArr)
         }
 
-        val overlap = coveragePct(pa, keep, a.width, a.height)
-        val visRes = if (poseOk) medianResidual(pa, pb, keep, rArr, k) else 0.0
-        val imuRes = if (imuRotCam != null) medianResidual(pa, pb, keep, imuRotCam, k) else 0.0
+        val overlapE = coveragePct(pa, keepE, a.width, a.height)
+        val visRes = if (poseOk) medianResidual(pa, pb, keepE, rArr, k) else 0.0
+        val imuRes = if (imuRotCam != null) FrameSynchronizer.median((0 until n).filter { keepE[it] }.map { resid[it] }) else 0.0
         val disagreement = if (poseOk && imuRotCam != null) Mat3.angleDeg(Mat3.mul(Mat3.transpose(rArr), imuRotCam)) else 0.0
 
-        p1.release(); p2.release(); kMat.release(); mask.release(); eAll.release(); e.release(); rMat.release(); tMat.release()
-        return VisualMetrics(n, inliers, poseInliers, overlap, visRes, imuRes, if (poseOk) rArr else null, if (poseOk) tArr else null, disagreement)
+        p1.release(); p2.release(); kMat.release(); mask.release(); poseMask.release(); tri.release()
+        eAll.release(); e.release(); rMat.release(); tMat.release()
+        return VisualMetrics(
+            n, eInliers, poseInliers, max(overlapE, overlapC), consistentPct,
+            visRes, imuRes, flowMedian, if (poseOk) rArr else null, if (poseOk) tArr else null, disagreement
+        )
     }
 
-    /** Convex-hull area of the surviving matches in image A, as a percentage of the frame: "how much of A is still matched". */
+    /** Convex-hull area of the selected matches in image A as a percentage of the frame. */
     private fun coveragePct(pa: List<Point>, keep: BooleanArray, w: Int, h: Int): Double {
         val pts = ArrayList<Point>()
         for (i in pa.indices) if (keep[i]) pts.add(pa[i])
@@ -148,21 +175,22 @@ class VisualTracker(nFeatures: Int = 1500) {
         return (100.0 * area / (w.toDouble() * h)).coerceIn(0.0, 100.0)
     }
 
-    /** Median distance between observed x2 and the position predicted by rotation-only motion x2 ≈ K R K^-1 x1. */
+    /** Distance between observed x2 and the rotation-only prediction x2 ≈ K R K^-1 x1. */
+    private fun residual(p1: Point, p2: Point, r: DoubleArray, k: Intrinsics): Double {
+        val x = (p1.x - k.cx) / k.fx
+        val y = (p1.y - k.cy) / k.fy
+        val xx = r[0] * x + r[1] * y + r[2]
+        val yy = r[3] * x + r[4] * y + r[5]
+        val zz = r[6] * x + r[7] * y + r[8]
+        if (zz <= 1e-6) return 1.0e6
+        val u = k.fx * xx / zz + k.cx
+        val v = k.fy * yy / zz + k.cy
+        return hypot(p2.x - u, p2.y - v)
+    }
+
     private fun medianResidual(pa: List<Point>, pb: List<Point>, keep: BooleanArray, r: DoubleArray, k: Intrinsics): Double {
         val res = ArrayList<Double>()
-        for (i in pa.indices) {
-            if (!keep[i]) continue
-            val x = (pa[i].x - k.cx) / k.fx
-            val y = (pa[i].y - k.cy) / k.fy
-            val xx = r[0] * x + r[1] * y + r[2]
-            val yy = r[3] * x + r[4] * y + r[5]
-            val zz = r[6] * x + r[7] * y + r[8]
-            if (zz <= 1e-6) continue
-            val u = k.fx * xx / zz + k.cx
-            val v = k.fy * yy / zz + k.cy
-            res.add(hypot(pb[i].x - u, pb[i].y - v))
-        }
+        for (i in pa.indices) if (keep[i]) res.add(residual(pa[i], pb[i], r, k))
         return FrameSynchronizer.median(res)
     }
 }
